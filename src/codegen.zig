@@ -30,6 +30,9 @@ const ArmFunction = Arm.Function;
 const AArch64 = @import("codegen/aarch64.zig");
 const AArch64Function = AArch64.Function;
 
+const RV64 = @import("codegen/riscv64.zig");
+const RV64Function = RV64.Function;
+
 /// The codegen-related data that is stored in `ir.Inst.Block` instructions.
 pub const BlockData = struct {
     relocs: std.ArrayListUnmanaged(Reloc) = undefined,
@@ -120,7 +123,7 @@ pub fn generateSymbol(
                 //.r600 => return Function(.r600).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 //.amdgcn => return Function(.amdgcn).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 //.riscv32 => return Function(.riscv32).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
-                // .riscv64 => return Function(.riscv64).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
+                .riscv64 => return RV64Function.generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 //.sparc => return Function(.sparc).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 //.sparcv9 => return Function(.sparcv9).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 //.sparcel => return Function(.sparcel).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
