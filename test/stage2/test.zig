@@ -15,7 +15,7 @@ pub fn addCases(ctx: *TestContext) !void {
     try @import("cbe.zig").addCases(ctx);
     // try @import("spu-ii.zig").addCases(ctx);
     try @import("arm.zig").addCases(ctx);
-    // try @import("aarch64.zig").addCases(ctx);
+    try @import("aarch64.zig").addCases(ctx);
     try @import("llvm.zig").addCases(ctx);
     try @import("wasm.zig").addCases(ctx);
     try @import("darwin.zig").addCases(ctx);

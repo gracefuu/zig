@@ -27,6 +27,9 @@ const X8664Function = X8664.Function;
 const Arm = @import("codegen/arm.zig");
 const ArmFunction = Arm.Function;
 
+const AArch64 = @import("codegen/aarch64.zig");
+const AArch64Function = AArch64.Function;
+
 /// The codegen-related data that is stored in `ir.Inst.Block` instructions.
 pub const BlockData = struct {
     relocs: std.ArrayListUnmanaged(Reloc) = undefined,
@@ -98,9 +101,9 @@ pub fn generateSymbol(
                 .wasm64 => unreachable, // has its own code path
                 .arm => return ArmFunction(.arm).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 .armeb => return ArmFunction(.armeb).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
-                // .aarch64 => return Function(.aarch64).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
-                // .aarch64_be => return Function(.aarch64_be).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
-                // .aarch64_32 => return Function(.aarch64_32).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
+                .aarch64 => return AArch64Function(.aarch64).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
+                .aarch64_be => return AArch64Function(.aarch64_be).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
+                .aarch64_32 => return AArch64Function(.aarch64_32).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 //.arc => return Function(.arc).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 //.avr => return Function(.avr).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 //.bpfel => return Function(.bpfel).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
