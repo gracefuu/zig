@@ -24,6 +24,9 @@ const X8664 = @import("codegen/x86_64.zig");
 const X8664Encoder = X8664.Encoder;
 const X8664Function = X8664.Function;
 
+const Arm = @import("codegen/arm.zig");
+const ArmFunction = Arm.Function;
+
 /// The codegen-related data that is stored in `ir.Inst.Block` instructions.
 pub const BlockData = struct {
     relocs: std.ArrayListUnmanaged(Reloc) = undefined,
@@ -93,8 +96,8 @@ pub fn generateSymbol(
             switch (bin_file.options.target.cpu.arch) {
                 .wasm32 => unreachable, // has its own code path
                 .wasm64 => unreachable, // has its own code path
-                // .arm => return Function(.arm).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
-                // .armeb => return Function(.armeb).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
+                .arm => return ArmFunction(.arm).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
+                .armeb => return ArmFunction(.armeb).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 // .aarch64 => return Function(.aarch64).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 // .aarch64_be => return Function(.aarch64_be).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 // .aarch64_32 => return Function(.aarch64_32).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
