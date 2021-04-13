@@ -20,7 +20,9 @@ const build_options = @import("build_options");
 const LazySrcLoc = Module.LazySrcLoc;
 const RegisterManager = @import("register_manager.zig").RegisterManager;
 
-const X8664Encoder = @import("codegen/x86_64.zig").Encoder;
+const X8664 = @import("codegen/x86_64.zig");
+const X8664Encoder = X8664.Encoder;
+const X8664Function = X8664.Function;
 
 /// The codegen-related data that is stored in `ir.Inst.Block` instructions.
 pub const BlockData = struct {
@@ -123,7 +125,7 @@ pub fn generateSymbol(
                 //.thumb => return Function(.thumb).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 //.thumbeb => return Function(.thumbeb).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 //.i386 => return Function(.i386).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
-                .x86_64 => return Function(.x86_64).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
+                .x86_64 => return X8664Function.generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 //.xcore => return Function(.xcore).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 //.nvptx => return Function(.nvptx).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
                 //.nvptx64 => return Function(.nvptx64).generateSymbol(bin_file, src_loc, typed_value, code, debug_output),
