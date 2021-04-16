@@ -4,8 +4,13 @@ const mem = std.mem;
 const assert = std.debug.assert;
 const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
-const Type = @import("../Type.zig");
+const Type = @import("../type.zig").Type;
 const DW = std.dwarf;
+
+const math = std.math;
+const ir = @import("../ir.zig");
+const Module = @import("../Module.zig");
+const LazySrcLoc = Module.LazySrcLoc;
 
 // zig fmt: off
 
@@ -715,3 +720,497 @@ test "x86_64 Encoder helpers" {
 //    K5 = (123, "k5"),
 //    K6 = (124, "k6"),
 //    K7 = (125, "k7"),
+
+/// Perform "binary" operators, excluding comparisons.
+/// Currently, the following ops are supported:
+/// ADD, SUB, XOR, OR, AND
+pub fn genX8664BinMath(
+    comptime Self: type,
+    self: *Self,
+    inst: *ir.Inst,
+    op_lhs: *ir.Inst,
+    op_rhs: *ir.Inst,
+) !Self.MCValue {
+    // We'll handle these ops in two steps.
+    // 1) Prepare an output location (register or memory)
+    //    This location will be the location of the operand that dies (if one exists)
+    //    or just a temporary register (if one doesn't exist)
+    // 2) Perform the op with the other argument
+    // 3) Sometimes, the output location is memory but the op doesn't support it.
+    //    In this case, copy that location to a register, then perform the op to that register instead.
+    //
+    // TODO: make this algorithm less bad
+
+    try self.code.ensureCapacity(self.code.items.len + 8);
+
+    const lhs = try self.resolveInst(op_lhs);
+    const rhs = try self.resolveInst(op_rhs);
+
+    // There are 2 operands, destination and source.
+    // Either one, but not both, can be a memory operand.
+    // Source operand can be an immediate, 8 bits or 32 bits.
+    // So, if either one of the operands dies with this instruction, we can use it
+    // as the result MCValue.
+    var dst_mcv: Self.MCValue = undefined;
+    var src_mcv: Self.MCValue = undefined;
+    var src_inst: *ir.Inst = undefined;
+    if (self.reuseOperand(inst, 0, lhs)) {
+        // LHS dies; use it as the destination.
+        // Both operands cannot be memory.
+        src_inst = op_rhs;
+        if (lhs.isMemory() and rhs.isMemory()) {
+            dst_mcv = try self.copyToNewRegister(inst, lhs);
+            src_mcv = rhs;
+        } else {
+            dst_mcv = lhs;
+            src_mcv = rhs;
+        }
+    } else if (self.reuseOperand(inst, 1, rhs)) {
+        // RHS dies; use it as the destination.
+        // Both operands cannot be memory.
+        src_inst = op_lhs;
+        if (lhs.isMemory() and rhs.isMemory()) {
+            dst_mcv = try self.copyToNewRegister(inst, rhs);
+            src_mcv = lhs;
+        } else {
+            dst_mcv = rhs;
+            src_mcv = lhs;
+        }
+    } else {
+        if (lhs.isMemory()) {
+            dst_mcv = try self.copyToNewRegister(inst, lhs);
+            src_mcv = rhs;
+            src_inst = op_rhs;
+        } else {
+            dst_mcv = try self.copyToNewRegister(inst, rhs);
+            src_mcv = lhs;
+            src_inst = op_lhs;
+        }
+    }
+    // This instruction supports only signed 32-bit immediates at most. If the immediate
+    // value is larger than this, we put it in a register.
+    // A potential opportunity for future optimization here would be keeping track
+    // of the fact that the instruction is available both as an immediate
+    // and as a register.
+    switch (src_mcv) {
+        .immediate => |imm| {
+            if (imm > math.maxInt(u31)) {
+                src_mcv = Self.MCValue{ .register = try self.copyToTmpRegister(src_inst.src, Type.initTag(.u64), src_mcv) };
+            }
+        },
+        else => {},
+    }
+
+    // Now for step 2, we perform the actual op
+    switch (inst.tag) {
+        // TODO: Generate wrapping and non-wrapping versions separately
+        .add, .addwrap => try genX8664BinMathCode(Self, self, inst.src, inst.ty, dst_mcv, src_mcv, 0, 0x00),
+        .bool_or, .bit_or => try genX8664BinMathCode(Self, self, inst.src, inst.ty, dst_mcv, src_mcv, 1, 0x08),
+        .bool_and, .bit_and => try genX8664BinMathCode(Self, self, inst.src, inst.ty, dst_mcv, src_mcv, 4, 0x20),
+        .sub, .subwrap => try genX8664BinMathCode(Self, self, inst.src, inst.ty, dst_mcv, src_mcv, 5, 0x28),
+        .xor, .not => try genX8664BinMathCode(Self, self, inst.src, inst.ty, dst_mcv, src_mcv, 6, 0x30),
+
+        .mul, .mulwrap => try genX8664Imul(Self, self, inst.src, inst.ty, dst_mcv, src_mcv),
+        else => unreachable,
+    }
+
+    return dst_mcv;
+}
+
+/// This function encodes a binary operation for x86_64
+/// intended for use with the following opcode ranges
+/// because they share the same structure.
+///
+/// Thus not all binary operations can be used here
+/// -- multiplication needs to be done with imul,
+/// which doesn't have as convenient an interface.
+///
+/// "opx"-style instructions use the opcode extension field to indicate which instruction to execute:
+///
+/// opx = /0: add
+/// opx = /1: or
+/// opx = /2: adc
+/// opx = /3: sbb
+/// opx = /4: and
+/// opx = /5: sub
+/// opx = /6: xor
+/// opx = /7: cmp
+///
+/// opcode  | operand shape
+/// --------+----------------------
+/// 80 /opx | *r/m8*,        imm8
+/// 81 /opx | *r/m16/32/64*, imm16/32
+/// 83 /opx | *r/m16/32/64*, imm8
+///
+/// "mr"-style instructions use the low bits of opcode to indicate shape of instruction:
+///
+/// mr = 00: add
+/// mr = 08: or
+/// mr = 10: adc
+/// mr = 18: sbb
+/// mr = 20: and
+/// mr = 28: sub
+/// mr = 30: xor
+/// mr = 38: cmp
+///
+/// opcode | operand shape
+/// -------+-------------------------
+/// mr + 0 | *r/m8*,        r8
+/// mr + 1 | *r/m16/32/64*, r16/32/64
+/// mr + 2 | *r8*,          r/m8
+/// mr + 3 | *r16/32/64*,   r/m16/32/64
+/// mr + 4 | *AL*,          imm8
+/// mr + 5 | *rAX*,         imm16/32
+///
+/// TODO: rotates and shifts share the same structure, so we can potentially implement them
+///       at a later date with very similar code.
+///       They have "opx"-style instructions, but no "mr"-style instructions.
+///
+/// opx = /0: rol,
+/// opx = /1: ror,
+/// opx = /2: rcl,
+/// opx = /3: rcr,
+/// opx = /4: shl sal,
+/// opx = /5: shr,
+/// opx = /6: sal shl,
+/// opx = /7: sar,
+///
+/// opcode  | operand shape
+/// --------+------------------
+/// c0 /opx | *r/m8*,        imm8
+/// c1 /opx | *r/m16/32/64*, imm8
+/// d0 /opx | *r/m8*,        1
+/// d1 /opx | *r/m16/32/64*, 1
+/// d2 /opx | *r/m8*,        CL    (for context, CL is register 1)
+/// d3 /opx | *r/m16/32/64*, CL    (for context, CL is register 1)
+pub fn genX8664BinMathCode(
+    comptime Self: type,
+    self: *Self,
+    src: LazySrcLoc,
+    dst_ty: Type,
+    dst_mcv: Self.MCValue,
+    src_mcv: Self.MCValue,
+    opx: u3,
+    mr: u8,
+) !void {
+    switch (dst_mcv) {
+        .none => unreachable,
+        .undef => unreachable,
+        .dead, .unreach, .immediate => unreachable,
+        .compare_flags_unsigned => unreachable,
+        .compare_flags_signed => unreachable,
+        .ptr_stack_offset => unreachable,
+        .ptr_embedded_in_code => unreachable,
+        .register => |dst_reg| {
+            switch (src_mcv) {
+                .none => unreachable,
+                .undef => try self.genSetReg(src, dst_ty, dst_reg, .undef),
+                .dead, .unreach => unreachable,
+                .ptr_stack_offset => unreachable,
+                .ptr_embedded_in_code => unreachable,
+                .register => |src_reg| {
+                    // for register, register use mr + 1
+                    // addressing mode: *r/m16/32/64*, r16/32/64
+                    const abi_size = dst_ty.abiSize(self.target.*);
+                    const encoder = try Encoder.init(self.code, 3);
+                    encoder.rex(.{
+                        .w = abi_size == 8,
+                        .r = src_reg.isExtended(),
+                        .b = dst_reg.isExtended(),
+                    });
+                    encoder.opcode_1byte(mr + 1);
+                    encoder.modRm_direct(
+                        src_reg.low_id(),
+                        dst_reg.low_id(),
+                    );
+                },
+                .immediate => |imm| {
+                    // register, immediate use opx = 81 or 83 addressing modes:
+                    // opx = 81: r/m16/32/64, imm16/32
+                    // opx = 83: r/m16/32/64, imm8
+                    const imm32 = @intCast(i32, imm); // This case must be handled before calling genX8664BinMathCode.
+                    if (imm32 <= math.maxInt(i8)) {
+                        const abi_size = dst_ty.abiSize(self.target.*);
+                        const encoder = try Encoder.init(self.code, 4);
+                        encoder.rex(.{
+                            .w = abi_size == 8,
+                            .b = dst_reg.isExtended(),
+                        });
+                        encoder.opcode_1byte(0x83);
+                        encoder.modRm_direct(
+                            opx,
+                            dst_reg.low_id(),
+                        );
+                        encoder.imm8(@intCast(i8, imm32));
+                    } else {
+                        const abi_size = dst_ty.abiSize(self.target.*);
+                        const encoder = try Encoder.init(self.code, 7);
+                        encoder.rex(.{
+                            .w = abi_size == 8,
+                            .b = dst_reg.isExtended(),
+                        });
+                        encoder.opcode_1byte(0x81);
+                        encoder.modRm_direct(
+                            opx,
+                            dst_reg.low_id(),
+                        );
+                        encoder.imm32(@intCast(i32, imm32));
+                    }
+                },
+                .embedded_in_code, .memory => {
+                    return self.fail(src, "TODO implement x86 ADD/SUB/CMP source memory", .{});
+                },
+                .stack_offset => |off| {
+                    // register, indirect use mr + 3
+                    // addressing mode: *r16/32/64*, r/m16/32/64
+                    const abi_size = dst_ty.abiSize(self.target.*);
+                    const adj_off = off + abi_size;
+                    if (off > math.maxInt(i32)) {
+                        return self.fail(src, "stack offset too large", .{});
+                    }
+                    const encoder = try Encoder.init(self.code, 7);
+                    encoder.rex(.{
+                        .w = abi_size == 8,
+                        .r = dst_reg.isExtended(),
+                    });
+                    encoder.opcode_1byte(mr + 3);
+                    if (adj_off <= std.math.maxInt(i8)) {
+                        encoder.modRm_indirectDisp8(
+                            dst_reg.low_id(),
+                            Register.ebp.low_id(),
+                        );
+                        encoder.disp8(-@intCast(i8, adj_off));
+                    } else {
+                        encoder.modRm_indirectDisp32(
+                            dst_reg.low_id(),
+                            Register.ebp.low_id(),
+                        );
+                        encoder.disp32(-@intCast(i32, adj_off));
+                    }
+                },
+                .compare_flags_unsigned => {
+                    return self.fail(src, "TODO implement x86 ADD/SUB/CMP source compare flag (unsigned)", .{});
+                },
+                .compare_flags_signed => {
+                    return self.fail(src, "TODO implement x86 ADD/SUB/CMP source compare flag (signed)", .{});
+                },
+            }
+        },
+        .stack_offset => |off| {
+            switch (src_mcv) {
+                .none => unreachable,
+                .undef => return self.genSetStack(src, dst_ty, off, .undef),
+                .dead, .unreach => unreachable,
+                .ptr_stack_offset => unreachable,
+                .ptr_embedded_in_code => unreachable,
+                .register => |src_reg| {
+                    try genX8664ModRMRegToStack(Self, self, src, dst_ty, off, src_reg, mr + 0x1);
+                },
+                .immediate => |imm| {
+                    return self.fail(src, "TODO implement x86 ADD/SUB/CMP source immediate", .{});
+                },
+                .embedded_in_code, .memory, .stack_offset => {
+                    return self.fail(src, "TODO implement x86 ADD/SUB/CMP source memory", .{});
+                },
+                .compare_flags_unsigned => {
+                    return self.fail(src, "TODO implement x86 ADD/SUB/CMP source compare flag (unsigned)", .{});
+                },
+                .compare_flags_signed => {
+                    return self.fail(src, "TODO implement x86 ADD/SUB/CMP source compare flag (signed)", .{});
+                },
+            }
+        },
+        .embedded_in_code, .memory => {
+            return self.fail(src, "TODO implement x86 ADD/SUB/CMP destination memory", .{});
+        },
+    }
+}
+
+/// Performs integer multiplication between dst_mcv and src_mcv, storing the result in dst_mcv.
+pub fn genX8664Imul(
+    comptime Self: type,
+    self: *Self,
+    src: LazySrcLoc,
+    dst_ty: Type,
+    dst_mcv: Self.MCValue,
+    src_mcv: Self.MCValue,
+) !void {
+    switch (dst_mcv) {
+        .none => unreachable,
+        .undef => unreachable,
+        .dead, .unreach, .immediate => unreachable,
+        .compare_flags_unsigned => unreachable,
+        .compare_flags_signed => unreachable,
+        .ptr_stack_offset => unreachable,
+        .ptr_embedded_in_code => unreachable,
+        .register => |dst_reg| {
+            switch (src_mcv) {
+                .none => unreachable,
+                .undef => try self.genSetReg(src, dst_ty, dst_reg, .undef),
+                .dead, .unreach => unreachable,
+                .ptr_stack_offset => unreachable,
+                .ptr_embedded_in_code => unreachable,
+                .register => |src_reg| {
+                    // register, register
+                    //
+                    // Use the following imul opcode
+                    // 0F AF /r: IMUL r32/64, r/m32/64
+                    const abi_size = dst_ty.abiSize(self.target.*);
+                    const encoder = try Encoder.init(self.code, 4);
+                    encoder.rex(.{
+                        .w = abi_size == 8,
+                        .r = dst_reg.isExtended(),
+                        .b = src_reg.isExtended(),
+                    });
+                    encoder.opcode_2byte(0x0f, 0xaf);
+                    encoder.modRm_direct(
+                        dst_reg.low_id(),
+                        src_reg.low_id(),
+                    );
+                },
+                .immediate => |imm| {
+                    // register, immediate:
+                    // depends on size of immediate.
+                    //
+                    // immediate fits in i8:
+                    // 6B /r ib: IMUL r32/64, r/m32/64, imm8
+                    //
+                    // immediate fits in i32:
+                    // 69 /r id: IMUL r32/64, r/m32/64, imm32
+                    //
+                    // immediate is huge:
+                    // split into 2 instructions
+                    // 1) copy the 64 bit immediate into a tmp register
+                    // 2) perform register,register mul
+                    // 0F AF /r: IMUL r32/64, r/m32/64
+                    if (math.minInt(i8) <= imm and imm <= math.maxInt(i8)) {
+                        const abi_size = dst_ty.abiSize(self.target.*);
+                        const encoder = try Encoder.init(self.code, 4);
+                        encoder.rex(.{
+                            .w = abi_size == 8,
+                            .r = dst_reg.isExtended(),
+                            .b = dst_reg.isExtended(),
+                        });
+                        encoder.opcode_1byte(0x6B);
+                        encoder.modRm_direct(
+                            dst_reg.low_id(),
+                            dst_reg.low_id(),
+                        );
+                        encoder.imm8(@intCast(i8, imm));
+                    } else if (math.minInt(i32) <= imm and imm <= math.maxInt(i32)) {
+                        const abi_size = dst_ty.abiSize(self.target.*);
+                        const encoder = try Encoder.init(self.code, 7);
+                        encoder.rex(.{
+                            .w = abi_size == 8,
+                            .r = dst_reg.isExtended(),
+                            .b = dst_reg.isExtended(),
+                        });
+                        encoder.opcode_1byte(0x69);
+                        encoder.modRm_direct(
+                            dst_reg.low_id(),
+                            dst_reg.low_id(),
+                        );
+                        encoder.imm32(@intCast(i32, imm));
+                    } else {
+                        const src_reg = try self.copyToTmpRegister(src, dst_ty, src_mcv);
+                        return genX8664Imul(Self, self, src, dst_ty, dst_mcv, Self.MCValue{ .register = src_reg });
+                    }
+                },
+                .embedded_in_code, .memory, .stack_offset => {
+                    return self.fail(src, "TODO implement x86 multiply source memory", .{});
+                },
+                .compare_flags_unsigned => {
+                    return self.fail(src, "TODO implement x86 multiply source compare flag (unsigned)", .{});
+                },
+                .compare_flags_signed => {
+                    return self.fail(src, "TODO implement x86 multiply source compare flag (signed)", .{});
+                },
+            }
+        },
+        .stack_offset => |off| {
+            switch (src_mcv) {
+                .none => unreachable,
+                .undef => return self.genSetStack(src, dst_ty, off, .undef),
+                .dead, .unreach => unreachable,
+                .ptr_stack_offset => unreachable,
+                .ptr_embedded_in_code => unreachable,
+                .register => |src_reg| {
+                    // copy dst to a register
+                    const dst_reg = try self.copyToTmpRegister(src, dst_ty, dst_mcv);
+                    // multiply into dst_reg
+                    // register, register
+                    // Use the following imul opcode
+                    // 0F AF /r: IMUL r32/64, r/m32/64
+                    const abi_size = dst_ty.abiSize(self.target.*);
+                    const encoder = try Encoder.init(self.code, 4);
+                    encoder.rex(.{
+                        .w = abi_size == 8,
+                        .r = dst_reg.isExtended(),
+                        .b = src_reg.isExtended(),
+                    });
+                    encoder.opcode_2byte(0x0f, 0xaf);
+                    encoder.modRm_direct(
+                        dst_reg.low_id(),
+                        src_reg.low_id(),
+                    );
+                    // copy dst_reg back out
+                    return self.genSetStack(src, dst_ty, off, Self.MCValue{ .register = dst_reg });
+                },
+                .immediate => |imm| {
+                    return self.fail(src, "TODO implement x86 multiply source immediate", .{});
+                },
+                .embedded_in_code, .memory, .stack_offset => {
+                    return self.fail(src, "TODO implement x86 multiply source memory", .{});
+                },
+                .compare_flags_unsigned => {
+                    return self.fail(src, "TODO implement x86 multiply source compare flag (unsigned)", .{});
+                },
+                .compare_flags_signed => {
+                    return self.fail(src, "TODO implement x86 multiply source compare flag (signed)", .{});
+                },
+            }
+        },
+        .embedded_in_code, .memory => {
+            return self.fail(src, "TODO implement x86 multiply destination memory", .{});
+        },
+    }
+}
+
+pub fn genX8664ModRMRegToStack(
+    comptime Self: type,
+    self: *Self,
+    src: LazySrcLoc,
+    ty: Type,
+    off: u32,
+    reg: Register,
+    opcode: u8,
+) !void {
+    const abi_size = ty.abiSize(self.target.*);
+    const adj_off = off + abi_size;
+    if (off > math.maxInt(i32)) {
+        return self.fail(src, "stack offset too large", .{});
+    }
+
+    const i_adj_off = -@intCast(i32, adj_off);
+    const encoder = try Encoder.init(self.code, 7);
+    encoder.rex(.{
+        .w = abi_size == 8,
+        .r = reg.isExtended(),
+    });
+    encoder.opcode_1byte(opcode);
+    if (i_adj_off < std.math.maxInt(i8)) {
+        // example: 48 89 55 7f           mov    QWORD PTR [rbp+0x7f],rdx
+        encoder.modRm_indirectDisp8(
+            reg.low_id(),
+            Register.ebp.low_id(),
+        );
+        encoder.disp8(@intCast(i8, i_adj_off));
+    } else {
+        // example: 48 89 95 80 00 00 00  mov    QWORD PTR [rbp+0x80],rdx
+        encoder.modRm_indirectDisp32(
+            reg.low_id(),
+            Register.ebp.low_id(),
+        );
+        encoder.disp32(i_adj_off);
+    }
+}
