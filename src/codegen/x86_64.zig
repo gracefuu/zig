@@ -721,6 +721,79 @@ test "x86_64 Encoder helpers" {
 //    K6 = (124, "k6"),
 //    K7 = (125, "k7"),
 
+pub const MCValue = union(enum) {
+    /// No runtime bits. `void` types, empty structs, u0, enums with 1 tag, etc.
+    /// TODO Look into deleting this tag and using `dead` instead, since every use
+    /// of MCValue.none should be instead looking at the type and noticing it is 0 bits.
+    none,
+    /// Control flow will not allow this value to be observed.
+    unreach,
+    /// No more references to this value remain.
+    dead,
+    /// The value is undefined.
+    undef,
+    /// A pointer-sized integer that fits in a register.
+    /// If the type is a pointer, this is the pointer address in virtual address space.
+    immediate: u64,
+    /// The constant was emitted into the code, at this offset.
+    /// If the type is a pointer, it means the pointer address is embedded in the code.
+    embedded_in_code: usize,
+    /// The value is a pointer to a constant which was emitted into the code, at this offset.
+    ptr_embedded_in_code: usize,
+    /// The value is in a target-specific register.
+    register: Register,
+    /// The value is in memory at a hard-coded address.
+    /// If the type is a pointer, it means the pointer address is at this memory location.
+    memory: u64,
+    /// The value is one of the stack variables.
+    /// If the type is a pointer, it means the pointer address is in the stack at this offset.
+    stack_offset: u32,
+    /// The value is a pointer to one of the stack variables (payload is stack offset).
+    ptr_stack_offset: u32,
+    /// The value is in the compare flags assuming an unsigned operation,
+    /// with this operator applied on top of it.
+    compare_flags_unsigned: math.CompareOperator,
+    /// The value is in the compare flags assuming a signed operation,
+    /// with this operator applied on top of it.
+    compare_flags_signed: math.CompareOperator,
+
+    pub fn isMemory(mcv: MCValue) bool {
+        return switch (mcv) {
+            .embedded_in_code, .memory, .stack_offset => true,
+            else => false,
+        };
+    }
+
+    pub fn isImmediate(mcv: MCValue) bool {
+        return switch (mcv) {
+            .immediate => true,
+            else => false,
+        };
+    }
+
+    pub fn isMutable(mcv: MCValue) bool {
+        return switch (mcv) {
+            .none => unreachable,
+            .unreach => unreachable,
+            .dead => unreachable,
+
+            .immediate,
+            .embedded_in_code,
+            .memory,
+            .compare_flags_unsigned,
+            .compare_flags_signed,
+            .ptr_stack_offset,
+            .ptr_embedded_in_code,
+            .undef,
+            => false,
+
+            .register,
+            .stack_offset,
+            => true,
+        };
+    }
+};
+
 /// Perform "binary" operators, excluding comparisons.
 /// Currently, the following ops are supported:
 /// ADD, SUB, XOR, OR, AND
@@ -730,7 +803,7 @@ pub fn genX8664BinMath(
     inst: *ir.Inst,
     op_lhs: *ir.Inst,
     op_rhs: *ir.Inst,
-) !Self.MCValue {
+) !MCValue {
     // We'll handle these ops in two steps.
     // 1) Prepare an output location (register or memory)
     //    This location will be the location of the operand that dies (if one exists)
@@ -751,8 +824,8 @@ pub fn genX8664BinMath(
     // Source operand can be an immediate, 8 bits or 32 bits.
     // So, if either one of the operands dies with this instruction, we can use it
     // as the result MCValue.
-    var dst_mcv: Self.MCValue = undefined;
-    var src_mcv: Self.MCValue = undefined;
+    var dst_mcv: MCValue = undefined;
+    var src_mcv: MCValue = undefined;
     var src_inst: *ir.Inst = undefined;
     if (self.reuseOperand(inst, 0, lhs)) {
         // LHS dies; use it as the destination.
@@ -795,7 +868,7 @@ pub fn genX8664BinMath(
     switch (src_mcv) {
         .immediate => |imm| {
             if (imm > math.maxInt(u31)) {
-                src_mcv = Self.MCValue{ .register = try self.copyToTmpRegister(src_inst.src, Type.initTag(.u64), src_mcv) };
+                src_mcv = MCValue{ .register = try self.copyToTmpRegister(src_inst.src, Type.initTag(.u64), src_mcv) };
             }
         },
         else => {},
@@ -888,8 +961,8 @@ pub fn genX8664BinMathCode(
     self: *Self,
     src: LazySrcLoc,
     dst_ty: Type,
-    dst_mcv: Self.MCValue,
-    src_mcv: Self.MCValue,
+    dst_mcv: MCValue,
+    src_mcv: MCValue,
     opx: u3,
     mr: u8,
 ) !void {
@@ -1032,8 +1105,8 @@ pub fn genX8664Imul(
     self: *Self,
     src: LazySrcLoc,
     dst_ty: Type,
-    dst_mcv: Self.MCValue,
-    src_mcv: Self.MCValue,
+    dst_mcv: MCValue,
+    src_mcv: MCValue,
 ) !void {
     switch (dst_mcv) {
         .none => unreachable,
@@ -1113,7 +1186,7 @@ pub fn genX8664Imul(
                         encoder.imm32(@intCast(i32, imm));
                     } else {
                         const src_reg = try self.copyToTmpRegister(src, dst_ty, src_mcv);
-                        return genX8664Imul(Self, self, src, dst_ty, dst_mcv, Self.MCValue{ .register = src_reg });
+                        return genX8664Imul(Self, self, src, dst_ty, dst_mcv, MCValue{ .register = src_reg });
                     }
                 },
                 .embedded_in_code, .memory, .stack_offset => {
@@ -1154,7 +1227,7 @@ pub fn genX8664Imul(
                         src_reg.low_id(),
                     );
                     // copy dst_reg back out
-                    return self.genSetStack(src, dst_ty, off, Self.MCValue{ .register = dst_reg });
+                    return self.genSetStack(src, dst_ty, off, MCValue{ .register = dst_reg });
                 },
                 .immediate => |imm| {
                     return self.fail(src, "TODO implement x86 multiply source immediate", .{});

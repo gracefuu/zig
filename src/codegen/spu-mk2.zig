@@ -1,4 +1,5 @@
 const std = @import("std");
+const math = std.math;
 
 pub const Interpreter = @import("spu-mk2/interpreter.zig").Interpreter;
 
@@ -168,3 +169,76 @@ pub const Register = enum {
 };
 
 pub const callee_preserved_regs = [_]Register{};
+
+pub const MCValue = union(enum) {
+    /// No runtime bits. `void` types, empty structs, u0, enums with 1 tag, etc.
+    /// TODO Look into deleting this tag and using `dead` instead, since every use
+    /// of MCValue.none should be instead looking at the type and noticing it is 0 bits.
+    none,
+    /// Control flow will not allow this value to be observed.
+    unreach,
+    /// No more references to this value remain.
+    dead,
+    /// The value is undefined.
+    undef,
+    /// A pointer-sized integer that fits in a register.
+    /// If the type is a pointer, this is the pointer address in virtual address space.
+    immediate: u64,
+    /// The constant was emitted into the code, at this offset.
+    /// If the type is a pointer, it means the pointer address is embedded in the code.
+    embedded_in_code: usize,
+    /// The value is a pointer to a constant which was emitted into the code, at this offset.
+    ptr_embedded_in_code: usize,
+    /// The value is in a target-specific register.
+    register: Register,
+    /// The value is in memory at a hard-coded address.
+    /// If the type is a pointer, it means the pointer address is at this memory location.
+    memory: u64,
+    /// The value is one of the stack variables.
+    /// If the type is a pointer, it means the pointer address is in the stack at this offset.
+    stack_offset: u32,
+    /// The value is a pointer to one of the stack variables (payload is stack offset).
+    ptr_stack_offset: u32,
+    /// The value is in the compare flags assuming an unsigned operation,
+    /// with this operator applied on top of it.
+    compare_flags_unsigned: math.CompareOperator,
+    /// The value is in the compare flags assuming a signed operation,
+    /// with this operator applied on top of it.
+    compare_flags_signed: math.CompareOperator,
+
+    pub fn isMemory(mcv: MCValue) bool {
+        return switch (mcv) {
+            .embedded_in_code, .memory, .stack_offset => true,
+            else => false,
+        };
+    }
+
+    pub fn isImmediate(mcv: MCValue) bool {
+        return switch (mcv) {
+            .immediate => true,
+            else => false,
+        };
+    }
+
+    pub fn isMutable(mcv: MCValue) bool {
+        return switch (mcv) {
+            .none => unreachable,
+            .unreach => unreachable,
+            .dead => unreachable,
+
+            .immediate,
+            .embedded_in_code,
+            .memory,
+            .compare_flags_unsigned,
+            .compare_flags_signed,
+            .ptr_stack_offset,
+            .ptr_embedded_in_code,
+            .undef,
+            => false,
+
+            .register,
+            .stack_offset,
+            => true,
+        };
+    }
+};
