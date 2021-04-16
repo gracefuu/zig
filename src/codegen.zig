@@ -22,6 +22,9 @@ const RegisterManager = @import("register_manager.zig").RegisterManager;
 
 const X8664Encoder = @import("codegen/x86_64.zig").Encoder;
 
+const x86_64 = @import("codegen/x86_64.zig");
+const arm = @import("codegen/arm.zig");
+
 /// The codegen-related data that is stored in `ir.Inst.Block` instructions.
 pub const BlockData = struct {
     relocs: std.ArrayListUnmanaged(Reloc) = undefined,
@@ -299,7 +302,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
         /// to place a new stack allocation, it goes here, and then bumps `max_end_stack`.
         next_stack_offset: u32 = 0,
 
-        const MCValue = union(enum) {
+        pub const MCValue = union(enum) {
             /// No runtime bits. `void` types, empty structs, u0, enums with 1 tag, etc.
             /// TODO Look into deleting this tag and using `dead` instead, since every use
             /// of MCValue.none should be instead looking at the type and noticing it is 0 bits.
@@ -944,7 +947,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
         /// Copies a value to a register without tracking the register. The register is not considered
         /// allocated. A second call to `copyToTmpRegister` may return the same register.
         /// This can have a side effect of spilling instructions to the stack to free up a register.
-        fn copyToTmpRegister(self: *Self, src: LazySrcLoc, ty: Type, mcv: MCValue) !Register {
+        pub fn copyToTmpRegister(self: *Self, src: LazySrcLoc, ty: Type, mcv: MCValue) !Register {
             const reg = try self.register_manager.allocRegWithoutTracking();
             try self.genSetReg(src, ty, reg, mcv);
             return reg;
@@ -953,7 +956,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
         /// Allocates a new register and copies `mcv` into it.
         /// `reg_owner` is the instruction that gets associated with the register in the register table.
         /// This can have a side effect of spilling instructions to the stack to free up a register.
-        fn copyToNewRegister(self: *Self, reg_owner: *ir.Inst, mcv: MCValue) !MCValue {
+        pub fn copyToNewRegister(self: *Self, reg_owner: *ir.Inst, mcv: MCValue) !MCValue {
             try self.register_manager.registers.ensureCapacity(self.gpa, @intCast(u32, self.register_manager.registers.count() + 1));
 
             const reg = try self.register_manager.allocReg(reg_owner);
@@ -1048,7 +1051,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                         },
                         .val = Value.initTag(.bool_true),
                     };
-                    return try self.genArmBinOp(&inst.base, inst.operand, &imm.base, .not);
+                    return try arm.genArmBinOp(Self, arch, self, &inst.base, inst.operand, &imm.base, .not);
                 },
                 else => return self.fail(inst.base.src, "TODO implement NOT for {}", .{self.target.cpu.arch}),
             }
@@ -1062,7 +1065,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                 .x86_64 => {
                     return try self.genX8664BinMath(&inst.base, inst.lhs, inst.rhs);
                 },
-                .arm, .armeb => return try self.genArmBinOp(&inst.base, inst.lhs, inst.rhs, .add),
+                .arm, .armeb => return try arm.genArmBinOp(Self, arch, self, &inst.base, inst.lhs, inst.rhs, .add),
                 else => return self.fail(inst.base.src, "TODO implement add for {}", .{self.target.cpu.arch}),
             }
         }
@@ -1082,7 +1085,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                 return MCValue.dead;
             switch (arch) {
                 .x86_64 => return try self.genX8664BinMath(&inst.base, inst.lhs, inst.rhs),
-                .arm, .armeb => return try self.genArmMul(&inst.base, inst.lhs, inst.rhs),
+                .arm, .armeb => return try arm.genArmMul(Self, arch, self, &inst.base, inst.lhs, inst.rhs),
                 else => return self.fail(inst.base.src, "TODO implement mul for {}", .{self.target.cpu.arch}),
             }
         }
@@ -1110,7 +1113,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
             if (inst.base.isUnused())
                 return MCValue.dead;
             switch (arch) {
-                .arm, .armeb => return try self.genArmBinOp(&inst.base, inst.lhs, inst.rhs, .bit_and),
+                .arm, .armeb => return try arm.genArmBinOp(Self, arch, self, &inst.base, inst.lhs, inst.rhs, .bit_and),
                 else => return self.fail(inst.base.src, "TODO implement bitwise and for {}", .{self.target.cpu.arch}),
             }
         }
@@ -1120,7 +1123,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
             if (inst.base.isUnused())
                 return MCValue.dead;
             switch (arch) {
-                .arm, .armeb => return try self.genArmBinOp(&inst.base, inst.lhs, inst.rhs, .bit_or),
+                .arm, .armeb => return try arm.genArmBinOp(Self, arch, self, &inst.base, inst.lhs, inst.rhs, .bit_or),
                 else => return self.fail(inst.base.src, "TODO implement bitwise or for {}", .{self.target.cpu.arch}),
             }
         }
@@ -1130,7 +1133,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
             if (inst.base.isUnused())
                 return MCValue.dead;
             switch (arch) {
-                .arm, .armeb => return try self.genArmBinOp(&inst.base, inst.lhs, inst.rhs, .xor),
+                .arm, .armeb => return try arm.genArmBinOp(Self, arch, self, &inst.base, inst.lhs, inst.rhs, .xor),
                 else => return self.fail(inst.base.src, "TODO implement xor for {}", .{self.target.cpu.arch}),
             }
         }
@@ -1235,7 +1238,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
             }
         }
 
-        fn reuseOperand(self: *Self, inst: *ir.Inst, op_index: ir.Inst.DeathsBitIndex, mcv: MCValue) bool {
+        pub fn reuseOperand(self: *Self, inst: *ir.Inst, op_index: ir.Inst.DeathsBitIndex, mcv: MCValue) bool {
             if (!inst.operandDies(op_index))
                 return false;
 
@@ -1357,7 +1360,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                 .x86_64 => {
                     return try self.genX8664BinMath(&inst.base, inst.lhs, inst.rhs);
                 },
-                .arm, .armeb => return try self.genArmBinOp(&inst.base, inst.lhs, inst.rhs, .sub),
+                .arm, .armeb => return try arm.genArmBinOp(Self, arch, self, &inst.base, inst.lhs, inst.rhs, .sub),
                 else => return self.fail(inst.base.src, "TODO implement sub for {}", .{self.target.cpu.arch}),
             }
         }
@@ -1369,135 +1372,6 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
             switch (arch) {
                 else => return self.fail(inst.base.src, "TODO implement subwrap for {}", .{self.target.cpu.arch}),
             }
-        }
-
-        fn genArmBinOp(self: *Self, inst: *ir.Inst, op_lhs: *ir.Inst, op_rhs: *ir.Inst, op: ir.Inst.Tag) !MCValue {
-            const lhs = try self.resolveInst(op_lhs);
-            const rhs = try self.resolveInst(op_rhs);
-
-            // Destination must be a register
-            var dst_mcv: MCValue = undefined;
-            var lhs_mcv: MCValue = undefined;
-            var rhs_mcv: MCValue = undefined;
-            if (self.reuseOperand(inst, 0, lhs)) {
-                // LHS is the destination
-                // RHS is the source
-                lhs_mcv = if (lhs != .register) try self.copyToNewRegister(inst, lhs) else lhs;
-                rhs_mcv = rhs;
-                dst_mcv = lhs_mcv;
-            } else if (self.reuseOperand(inst, 1, rhs)) {
-                // RHS is the destination
-                // LHS is the source
-                lhs_mcv = lhs;
-                rhs_mcv = if (rhs != .register) try self.copyToNewRegister(inst, rhs) else rhs;
-                dst_mcv = rhs_mcv;
-            } else {
-                // TODO save 1 copy instruction by directly allocating the destination register
-                // LHS is the destination
-                // RHS is the source
-                lhs_mcv = try self.copyToNewRegister(inst, lhs);
-                rhs_mcv = rhs;
-                dst_mcv = lhs_mcv;
-            }
-
-            try self.genArmBinOpCode(inst.src, dst_mcv.register, lhs_mcv, rhs_mcv, op);
-            return dst_mcv;
-        }
-
-        fn genArmBinOpCode(
-            self: *Self,
-            src: LazySrcLoc,
-            dst_reg: Register,
-            lhs_mcv: MCValue,
-            rhs_mcv: MCValue,
-            op: ir.Inst.Tag,
-        ) !void {
-            assert(lhs_mcv == .register or lhs_mcv == .register);
-
-            const swap_lhs_and_rhs = rhs_mcv == .register and lhs_mcv != .register;
-            const op1 = if (swap_lhs_and_rhs) rhs_mcv.register else lhs_mcv.register;
-            const op2 = if (swap_lhs_and_rhs) lhs_mcv else rhs_mcv;
-
-            const operand = switch (op2) {
-                .none => unreachable,
-                .undef => unreachable,
-                .dead, .unreach => unreachable,
-                .compare_flags_unsigned => unreachable,
-                .compare_flags_signed => unreachable,
-                .ptr_stack_offset => unreachable,
-                .ptr_embedded_in_code => unreachable,
-                .immediate => |imm| blk: {
-                    if (imm > std.math.maxInt(u32)) return self.fail(src, "TODO ARM binary arithmetic immediate larger than u32", .{});
-
-                    // Load immediate into register if it doesn't fit
-                    // as an operand
-                    break :blk Instruction.Operand.fromU32(@intCast(u32, imm)) orelse
-                        Instruction.Operand.reg(try self.copyToTmpRegister(src, Type.initTag(.u32), op2), Instruction.Operand.Shift.none);
-                },
-                .register => |reg| Instruction.Operand.reg(reg, Instruction.Operand.Shift.none),
-                .stack_offset,
-                .embedded_in_code,
-                .memory,
-                => Instruction.Operand.reg(try self.copyToTmpRegister(src, Type.initTag(.u32), op2), Instruction.Operand.Shift.none),
-            };
-
-            switch (op) {
-                .add => {
-                    writeInt(u32, try self.code.addManyAsArray(4), Instruction.add(.al, dst_reg, op1, operand).toU32());
-                },
-                .sub => {
-                    if (swap_lhs_and_rhs) {
-                        writeInt(u32, try self.code.addManyAsArray(4), Instruction.rsb(.al, dst_reg, op1, operand).toU32());
-                    } else {
-                        writeInt(u32, try self.code.addManyAsArray(4), Instruction.sub(.al, dst_reg, op1, operand).toU32());
-                    }
-                },
-                .bool_and, .bit_and => {
-                    writeInt(u32, try self.code.addManyAsArray(4), Instruction.@"and"(.al, dst_reg, op1, operand).toU32());
-                },
-                .bool_or, .bit_or => {
-                    writeInt(u32, try self.code.addManyAsArray(4), Instruction.orr(.al, dst_reg, op1, operand).toU32());
-                },
-                .not, .xor => {
-                    writeInt(u32, try self.code.addManyAsArray(4), Instruction.eor(.al, dst_reg, op1, operand).toU32());
-                },
-                .cmp_eq => {
-                    writeInt(u32, try self.code.addManyAsArray(4), Instruction.cmp(.al, op1, operand).toU32());
-                },
-                else => unreachable, // not a binary instruction
-            }
-        }
-
-        fn genArmMul(self: *Self, inst: *ir.Inst, op_lhs: *ir.Inst, op_rhs: *ir.Inst) !MCValue {
-            const lhs = try self.resolveInst(op_lhs);
-            const rhs = try self.resolveInst(op_rhs);
-
-            // Destination must be a register
-            // LHS must be a register
-            // RHS must be a register
-            var dst_mcv: MCValue = undefined;
-            var lhs_mcv: MCValue = undefined;
-            var rhs_mcv: MCValue = undefined;
-            if (self.reuseOperand(inst, 0, lhs)) {
-                // LHS is the destination
-                lhs_mcv = if (lhs != .register) try self.copyToNewRegister(inst, lhs) else lhs;
-                rhs_mcv = if (rhs != .register) try self.copyToNewRegister(inst, rhs) else rhs;
-                dst_mcv = lhs_mcv;
-            } else if (self.reuseOperand(inst, 1, rhs)) {
-                // RHS is the destination
-                lhs_mcv = if (lhs != .register) try self.copyToNewRegister(inst, lhs) else lhs;
-                rhs_mcv = if (rhs != .register) try self.copyToNewRegister(inst, rhs) else rhs;
-                dst_mcv = rhs_mcv;
-            } else {
-                // TODO save 1 copy instruction by directly allocating the destination register
-                // LHS is the destination
-                lhs_mcv = try self.copyToNewRegister(inst, lhs);
-                rhs_mcv = if (rhs != .register) try self.copyToNewRegister(inst, rhs) else rhs;
-                dst_mcv = lhs_mcv;
-            }
-
-            writeInt(u32, try self.code.addManyAsArray(4), Instruction.mul(.al, dst_mcv.register, lhs_mcv.register, rhs_mcv.register).toU32());
-            return dst_mcv;
         }
 
         /// Perform "binary" operators, excluding comparisons.
@@ -2602,7 +2476,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                     const src_mcv = rhs;
                     const dst_mcv = if (lhs != .register) try self.copyToNewRegister(inst.lhs, lhs) else lhs;
 
-                    try self.genArmBinOpCode(inst.base.src, dst_mcv.register, dst_mcv, src_mcv, .cmp_eq);
+                    try arm.genArmBinOpCode(Self, arch, self, inst.base.src, dst_mcv.register, dst_mcv, src_mcv, .cmp_eq);
                     const info = inst.lhs.ty.intInfo(self.target.*);
                     return switch (info.signedness) {
                         .signed => MCValue{ .compare_flags_signed = op },
@@ -2989,8 +2863,8 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
                     else => unreachable, // Not a boolean operation
                 },
                 .arm, .armeb => switch (inst.base.tag) {
-                    .bool_and => return try self.genArmBinOp(&inst.base, inst.lhs, inst.rhs, .bool_and),
-                    .bool_or => return try self.genArmBinOp(&inst.base, inst.lhs, inst.rhs, .bool_or),
+                    .bool_and => return try arm.genArmBinOp(Self, arch, self, &inst.base, inst.lhs, inst.rhs, .bool_and),
+                    .bool_or => return try arm.genArmBinOp(Self, arch, self, &inst.base, inst.lhs, inst.rhs, .bool_or),
                     else => unreachable, // Not a boolean operation
                 },
                 else => return self.fail(inst.base.src, "TODO implement boolean operations for {}", .{self.target.cpu.arch}),
@@ -4006,7 +3880,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
             return operand;
         }
 
-        fn resolveInst(self: *Self, inst: *ir.Inst) !MCValue {
+        pub fn resolveInst(self: *Self, inst: *ir.Inst) !MCValue {
             // If the type has no codegen bits, no need to store it.
             if (!inst.ty.hasCodeGenBits())
                 return MCValue.none;
@@ -4346,7 +4220,7 @@ fn Function(comptime arch: std.Target.Cpu.Arch) type {
             };
         }
 
-        fn fail(self: *Self, src: LazySrcLoc, comptime format: []const u8, args: anytype) InnerError {
+        pub fn fail(self: *Self, src: LazySrcLoc, comptime format: []const u8, args: anytype) InnerError {
             @setCold(true);
             assert(self.err_msg == null);
             const src_loc = if (src != .unneeded)

@@ -2,6 +2,13 @@ const std = @import("std");
 const DW = std.dwarf;
 const testing = std.testing;
 
+const Type = @import("../type.zig").Type;
+const mem = std.mem;
+const assert = std.debug.assert;
+const ir = @import("../ir.zig");
+const Module = @import("../Module.zig");
+const LazySrcLoc = Module.LazySrcLoc;
+
 /// The condition field specifies the flags neccessary for an
 /// Instruction to be executed
 pub const Condition = enum(u4) {
@@ -358,7 +365,7 @@ pub const Instruction = union(enum) {
                 rs: u4,
             },
 
-            pub const Type = enum(u2) {
+            pub const Type_ = enum(u2) {
                 logical_left,
                 logical_right,
                 arithmetic_right,
@@ -379,7 +386,7 @@ pub const Instruction = union(enum) {
                 };
             }
 
-            pub fn reg(rs: Register, typ: Type) Shift {
+            pub fn reg(rs: Register, typ: Type_) Shift {
                 return Shift{
                     .Register = .{
                         .rs = rs.id(),
@@ -388,7 +395,7 @@ pub const Instruction = union(enum) {
                 };
             }
 
-            pub fn imm(amount: u5, typ: Type) Shift {
+            pub fn imm(amount: u5, typ: Type_) Shift {
                 return Shift{
                     .Immediate = .{
                         .amount = amount,
@@ -1267,4 +1274,158 @@ test "aliases" {
     for (testcases) |case| {
         testing.expectEqual(case.expected.toU32(), case.actual.toU32());
     }
+}
+
+pub fn genArmBinOp(
+    comptime Self: type,
+    comptime arch: std.Target.Cpu.Arch,
+    self: *Self,
+    inst: *ir.Inst,
+    op_lhs: *ir.Inst,
+    op_rhs: *ir.Inst,
+    op: ir.Inst.Tag,
+) !Self.MCValue {
+    const lhs = try self.resolveInst(op_lhs);
+    const rhs = try self.resolveInst(op_rhs);
+
+    // Destination must be a register
+    var dst_mcv: Self.MCValue = undefined;
+    var lhs_mcv: Self.MCValue = undefined;
+    var rhs_mcv: Self.MCValue = undefined;
+    if (self.reuseOperand(inst, 0, lhs)) {
+        // LHS is the destination
+        // RHS is the source
+        lhs_mcv = if (lhs != .register) try self.copyToNewRegister(inst, lhs) else lhs;
+        rhs_mcv = rhs;
+        dst_mcv = lhs_mcv;
+    } else if (self.reuseOperand(inst, 1, rhs)) {
+        // RHS is the destination
+        // LHS is the source
+        lhs_mcv = lhs;
+        rhs_mcv = if (rhs != .register) try self.copyToNewRegister(inst, rhs) else rhs;
+        dst_mcv = rhs_mcv;
+    } else {
+        // TODO save 1 copy instruction by directly allocating the destination register
+        // LHS is the destination
+        // RHS is the source
+        lhs_mcv = try self.copyToNewRegister(inst, lhs);
+        rhs_mcv = rhs;
+        dst_mcv = lhs_mcv;
+    }
+
+    try genArmBinOpCode(Self, arch, self, inst.src, dst_mcv.register, lhs_mcv, rhs_mcv, op);
+    return dst_mcv;
+}
+
+pub fn genArmBinOpCode(
+    comptime Self: type,
+    comptime arch: std.Target.Cpu.Arch,
+    self: *Self,
+    src: LazySrcLoc,
+    dst_reg: Register,
+    lhs_mcv: Self.MCValue,
+    rhs_mcv: Self.MCValue,
+    op: ir.Inst.Tag,
+) !void {
+    comptime const writeInt = switch (arch.endian()) {
+        .Little => mem.writeIntLittle,
+        .Big => mem.writeIntBig,
+    };
+    assert(lhs_mcv == .register or lhs_mcv == .register);
+
+    const swap_lhs_and_rhs = rhs_mcv == .register and lhs_mcv != .register;
+    const op1 = if (swap_lhs_and_rhs) rhs_mcv.register else lhs_mcv.register;
+    const op2 = if (swap_lhs_and_rhs) lhs_mcv else rhs_mcv;
+
+    const operand = switch (op2) {
+        .none => unreachable,
+        .undef => unreachable,
+        .dead, .unreach => unreachable,
+        .compare_flags_unsigned => unreachable,
+        .compare_flags_signed => unreachable,
+        .ptr_stack_offset => unreachable,
+        .ptr_embedded_in_code => unreachable,
+        .immediate => |imm| blk: {
+            if (imm > std.math.maxInt(u32)) return self.fail(src, "TODO ARM binary arithmetic immediate larger than u32", .{});
+
+            // Load immediate into register if it doesn't fit
+            // as an operand
+            break :blk Instruction.Operand.fromU32(@intCast(u32, imm)) orelse
+                Instruction.Operand.reg(try self.copyToTmpRegister(src, Type.initTag(.u32), op2), Instruction.Operand.Shift.none);
+        },
+        .register => |reg| Instruction.Operand.reg(reg, Instruction.Operand.Shift.none),
+        .stack_offset,
+        .embedded_in_code,
+        .memory,
+        => Instruction.Operand.reg(try self.copyToTmpRegister(src, Type.initTag(.u32), op2), Instruction.Operand.Shift.none),
+    };
+
+    switch (op) {
+        .add => {
+            writeInt(u32, try self.code.addManyAsArray(4), Instruction.add(.al, dst_reg, op1, operand).toU32());
+        },
+        .sub => {
+            if (swap_lhs_and_rhs) {
+                writeInt(u32, try self.code.addManyAsArray(4), Instruction.rsb(.al, dst_reg, op1, operand).toU32());
+            } else {
+                writeInt(u32, try self.code.addManyAsArray(4), Instruction.sub(.al, dst_reg, op1, operand).toU32());
+            }
+        },
+        .bool_and, .bit_and => {
+            writeInt(u32, try self.code.addManyAsArray(4), Instruction.@"and"(.al, dst_reg, op1, operand).toU32());
+        },
+        .bool_or, .bit_or => {
+            writeInt(u32, try self.code.addManyAsArray(4), Instruction.orr(.al, dst_reg, op1, operand).toU32());
+        },
+        .not, .xor => {
+            writeInt(u32, try self.code.addManyAsArray(4), Instruction.eor(.al, dst_reg, op1, operand).toU32());
+        },
+        .cmp_eq => {
+            writeInt(u32, try self.code.addManyAsArray(4), Instruction.cmp(.al, op1, operand).toU32());
+        },
+        else => unreachable, // not a binary instruction
+    }
+}
+
+pub fn genArmMul(
+    comptime Self: type,
+    comptime arch: std.Target.Cpu.Arch,
+    self: *Self,
+    inst: *ir.Inst,
+    op_lhs: *ir.Inst,
+    op_rhs: *ir.Inst,
+) !Self.MCValue {
+    comptime const writeInt = switch (arch.endian()) {
+        .Little => mem.writeIntLittle,
+        .Big => mem.writeIntBig,
+    };
+    const lhs = try self.resolveInst(op_lhs);
+    const rhs = try self.resolveInst(op_rhs);
+
+    // Destination must be a register
+    // LHS must be a register
+    // RHS must be a register
+    var dst_mcv: Self.MCValue = undefined;
+    var lhs_mcv: Self.MCValue = undefined;
+    var rhs_mcv: Self.MCValue = undefined;
+    if (self.reuseOperand(inst, 0, lhs)) {
+        // LHS is the destination
+        lhs_mcv = if (lhs != .register) try self.copyToNewRegister(inst, lhs) else lhs;
+        rhs_mcv = if (rhs != .register) try self.copyToNewRegister(inst, rhs) else rhs;
+        dst_mcv = lhs_mcv;
+    } else if (self.reuseOperand(inst, 1, rhs)) {
+        // RHS is the destination
+        lhs_mcv = if (lhs != .register) try self.copyToNewRegister(inst, lhs) else lhs;
+        rhs_mcv = if (rhs != .register) try self.copyToNewRegister(inst, rhs) else rhs;
+        dst_mcv = rhs_mcv;
+    } else {
+        // TODO save 1 copy instruction by directly allocating the destination register
+        // LHS is the destination
+        lhs_mcv = try self.copyToNewRegister(inst, lhs);
+        rhs_mcv = if (rhs != .register) try self.copyToNewRegister(inst, rhs) else rhs;
+        dst_mcv = lhs_mcv;
+    }
+
+    writeInt(u32, try self.code.addManyAsArray(4), Instruction.mul(.al, dst_mcv.register, lhs_mcv.register, rhs_mcv.register).toU32());
+    return dst_mcv;
 }
