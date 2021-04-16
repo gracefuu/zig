@@ -253,3 +253,20 @@ pub fn generateSymbol(
         },
     }
 }
+
+pub const StackAllocation = struct {
+    inst: *ir.Inst,
+    /// TODO do we need size? should be determined by inst.ty.abiSize()
+    size: u32,
+};
+
+pub fn Branch(comptime MCValue: type) type {
+    return struct {
+        inst_table: std.AutoArrayHashMapUnmanaged(*ir.Inst, MCValue) = .{},
+
+        pub fn deinit(self: *@This(), gpa: *Allocator) void {
+            self.inst_table.deinit(gpa);
+            self.* = undefined;
+        }
+    };
+}

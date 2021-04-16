@@ -742,12 +742,12 @@ const Result = Codegen.Result;
 const GenerateSymbolError = Codegen.GenerateSymbolError;
 const DebugInfoOutput = Codegen.DebugInfoOutput;
 
+const CodegenUtils = @import("utils.zig");
+
 const InnerError = error{
     OutOfMemory,
     CodegenFail,
 };
-
-const arch = std.Target.Cpu.Arch.x86_64;
 
 const writeInt = switch (arch.endian()) {
     .Little => mem.writeIntLittle,
@@ -802,7 +802,13 @@ pub const Function = struct {
     /// to place a new stack allocation, it goes here, and then bumps `max_end_stack`.
     next_stack_offset: u32 = 0,
 
-    const MCValue = union(enum) {
+    pub const arch: std.Target.Cpu.Arch = .x86_64;
+
+    pub fn getRegisterType() type {
+        return Register;
+    }
+
+    pub const MCValue = union(enum) {
         /// No runtime bits. `void` types, empty structs, u0, enums with 1 tag, etc.
         /// TODO Look into deleting this tag and using `dead` instead, since every use
         /// of MCValue.none should be instead looking at the type and noticing it is 0 bits.
@@ -875,20 +881,8 @@ pub const Function = struct {
         }
     };
 
-    const Branch = struct {
-        inst_table: std.AutoArrayHashMapUnmanaged(*ir.Inst, MCValue) = .{},
-
-        fn deinit(self: *Branch, gpa: *Allocator) void {
-            self.inst_table.deinit(gpa);
-            self.* = undefined;
-        }
-    };
-
-    const StackAllocation = struct {
-        inst: *ir.Inst,
-        /// TODO do we need size? should be determined by inst.ty.abiSize()
-        size: u32,
-    };
+    const StackAllocation = Codegen.StackAllocation;
+    const Branch = Codegen.Branch(MCValue);
 
     const Self = @This();
 
@@ -998,17 +992,17 @@ pub const Function = struct {
             const reloc_index = self.code.items.len;
             self.code.items.len += 4;
 
-            try self.dbgSetPrologueEnd();
+            try CodegenUtils.dbgSetPrologueEnd(Self, self);
             try self.genBody(self.mod_fn.body);
 
             const stack_end = self.max_end_stack;
             if (stack_end > math.maxInt(i32))
-                return self.failSymbol("too much stack used in call parameters", .{});
+                return CodegenUtils.failSymbol(Self, self, "too much stack used in call parameters", .{});
             const aligned_stack_end = mem.alignForward(stack_end, self.stack_align);
             mem.writeIntLittle(u32, self.code.items[reloc_index..][0..4], @intCast(u32, aligned_stack_end));
 
             if (self.code.items.len >= math.maxInt(i32)) {
-                return self.failSymbol("unable to perform relocation: jump too far", .{});
+                return CodegenUtils.failSymbol(Self, self, "unable to perform relocation: jump too far", .{});
             }
             if (self.exitlude_jump_relocs.items.len == 1) {
                 self.code.items.len -= 5;
@@ -1019,7 +1013,7 @@ pub const Function = struct {
             }
 
             // Important to be after the possible self.code.items.len -= 5 above.
-            try self.dbgSetEpilogueBegin();
+            try CodegenUtils.dbgSetEpilogueBegin(Self, self);
 
             try self.code.ensureCapacity(self.code.items.len + 9);
             // add rsp, x
@@ -1039,18 +1033,18 @@ pub const Function = struct {
                 0xc3, // ret
             });
         } else {
-            try self.dbgSetPrologueEnd();
+            try CodegenUtils.dbgSetPrologueEnd(Self, self);
             try self.genBody(self.mod_fn.body);
-            try self.dbgSetEpilogueBegin();
+            try CodegenUtils.dbgSetEpilogueBegin(Self, self);
         }
 
         // Drop them off at the rbrace.
-        try self.dbgAdvancePCAndLine(self.rbrace_src);
+        try CodegenUtils.dbgAdvancePCAndLine(Self, self, self.rbrace_src);
     }
 
     fn genBody(self: *Self, body: ir.Body) InnerError!void {
         for (body.instructions) |inst| {
-            try self.ensureProcessDeathCapacity(@popCount(@TypeOf(inst.deaths), inst.deaths));
+            try CodegenUtils.ensureProcessDeathCapacity(Self, self, @popCount(@TypeOf(inst.deaths), inst.deaths));
 
             const mcv = try self.genFuncInst(inst);
             if (!inst.isUnused()) {
@@ -1062,102 +1056,12 @@ pub const Function = struct {
             var i: ir.Inst.DeathsBitIndex = 0;
             while (inst.getOperand(i)) |operand| : (i += 1) {
                 if (inst.operandDies(i))
-                    self.processDeath(operand);
+                    CodegenUtils.processDeath(Self, self, operand);
             }
         }
     }
 
-    fn dbgSetPrologueEnd(self: *Self) InnerError!void {
-        switch (self.debug_output) {
-            .dwarf => |dbg_out| {
-                try dbg_out.dbg_line.append(DW.LNS_set_prologue_end);
-                try self.dbgAdvancePCAndLine(self.prev_di_src);
-            },
-            .none => {},
-        }
-    }
-
-    fn dbgSetEpilogueBegin(self: *Self) InnerError!void {
-        switch (self.debug_output) {
-            .dwarf => |dbg_out| {
-                try dbg_out.dbg_line.append(DW.LNS_set_epilogue_begin);
-                try self.dbgAdvancePCAndLine(self.prev_di_src);
-            },
-            .none => {},
-        }
-    }
-
-    fn dbgAdvancePCAndLine(self: *Self, abs_byte_off: usize) InnerError!void {
-        self.prev_di_src = abs_byte_off;
-        self.prev_di_pc = self.code.items.len;
-        switch (self.debug_output) {
-            .dwarf => |dbg_out| {
-                // TODO Look into improving the performance here by adding a token-index-to-line
-                // lookup table, and changing ir.Inst from storing byte offset to token. Currently
-                // this involves scanning over the source code for newlines
-                // (but only from the previous byte offset to the new one).
-                const delta_line = std.zig.lineDelta(self.source, self.prev_di_src, abs_byte_off);
-                const delta_pc = self.code.items.len - self.prev_di_pc;
-                // TODO Look into using the DWARF special opcodes to compress this data. It lets you emit
-                // single-byte opcodes that add different numbers to both the PC and the line number
-                // at the same time.
-                try dbg_out.dbg_line.ensureCapacity(dbg_out.dbg_line.items.len + 11);
-                dbg_out.dbg_line.appendAssumeCapacity(DW.LNS_advance_pc);
-                leb128.writeULEB128(dbg_out.dbg_line.writer(), delta_pc) catch unreachable;
-                if (delta_line != 0) {
-                    dbg_out.dbg_line.appendAssumeCapacity(DW.LNS_advance_line);
-                    leb128.writeILEB128(dbg_out.dbg_line.writer(), delta_line) catch unreachable;
-                }
-                dbg_out.dbg_line.appendAssumeCapacity(DW.LNS_copy);
-            },
-            .none => {},
-        }
-    }
-
-    /// Asserts there is already capacity to insert into top branch inst_table.
-    fn processDeath(self: *Self, inst: *ir.Inst) void {
-        if (inst.tag == .constant) return; // Constants are immortal.
-        // When editing this function, note that the logic must synchronize with `reuseOperand`.
-        const prev_value = self.getResolvedInstValue(inst);
-        const branch = &self.branch_stack.items[self.branch_stack.items.len - 1];
-        branch.inst_table.putAssumeCapacity(inst, .dead);
-        switch (prev_value) {
-            .register => |reg| {
-                const canon_reg = toCanonicalReg(reg);
-                self.register_manager.freeReg(canon_reg);
-            },
-            else => {}, // TODO process stack allocation death
-        }
-    }
-
-    fn ensureProcessDeathCapacity(self: *Self, additional_count: usize) !void {
-        const table = &self.branch_stack.items[self.branch_stack.items.len - 1].inst_table;
-        try table.ensureCapacity(self.gpa, table.items().len + additional_count);
-    }
-
-    /// Adds a Type to the .debug_info at the current position. The bytes will be populated later,
-    /// after codegen for this symbol is done.
-    fn addDbgInfoTypeReloc(self: *Self, ty: Type) !void {
-        switch (self.debug_output) {
-            .dwarf => |dbg_out| {
-                assert(ty.hasCodeGenBits());
-                const index = dbg_out.dbg_info.items.len;
-                try dbg_out.dbg_info.resize(index + 4); // DW.AT_type,  DW.FORM_ref4
-
-                const gop = try dbg_out.dbg_info_type_relocs.getOrPut(self.gpa, ty);
-                if (!gop.found_existing) {
-                    gop.entry.value = .{
-                        .off = undefined,
-                        .relocs = .{},
-                    };
-                }
-                try gop.entry.value.relocs.append(self.gpa, @intCast(u32, index));
-            },
-            .none => {},
-        }
-    }
-
-    fn genFuncInst(self: *Self, inst: *ir.Inst) !MCValue {
+    pub fn genFuncInst(self: *Self, inst: *ir.Inst) !MCValue {
         switch (inst.tag) {
             .add => return self.genAdd(inst.castTag(.add).?),
             .addwrap => return self.genAddWrap(inst.castTag(.addwrap).?),
@@ -1224,87 +1128,18 @@ pub const Function = struct {
         }
     }
 
-    fn allocMem(self: *Self, inst: *ir.Inst, abi_size: u32, abi_align: u32) !u32 {
-        if (abi_align > self.stack_align)
-            self.stack_align = abi_align;
-        // TODO find a free slot instead of always appending
-        const offset = mem.alignForwardGeneric(u32, self.next_stack_offset, abi_align);
-        self.next_stack_offset = offset + abi_size;
-        if (self.next_stack_offset > self.max_end_stack)
-            self.max_end_stack = self.next_stack_offset;
-        try self.stack.putNoClobber(self.gpa, offset, .{
-            .inst = inst,
-            .size = abi_size,
-        });
-        return offset;
-    }
-
-    /// Use a pointer instruction as the basis for allocating stack memory.
-    fn allocMemPtr(self: *Self, inst: *ir.Inst) !u32 {
-        const elem_ty = inst.ty.elemType();
-        const abi_size = math.cast(u32, elem_ty.abiSize(self.target.*)) catch {
-            return self.fail(inst.src, "type '{}' too big to fit into stack frame", .{elem_ty});
-        };
-        // TODO swap this for inst.ty.ptrAlign
-        const abi_align = elem_ty.abiAlignment(self.target.*);
-        return self.allocMem(inst, abi_size, abi_align);
-    }
-
-    fn allocRegOrMem(self: *Self, inst: *ir.Inst, reg_ok: bool) !MCValue {
-        const elem_ty = inst.ty;
-        const abi_size = math.cast(u32, elem_ty.abiSize(self.target.*)) catch {
-            return self.fail(inst.src, "type '{}' too big to fit into stack frame", .{elem_ty});
-        };
-        const abi_align = elem_ty.abiAlignment(self.target.*);
-        if (abi_align > self.stack_align)
-            self.stack_align = abi_align;
-
-        if (reg_ok) {
-            // Make sure the type can fit in a register before we try to allocate one.
-            const ptr_bits = arch.ptrBitWidth();
-            const ptr_bytes: u64 = @divExact(ptr_bits, 8);
-            if (abi_size <= ptr_bytes) {
-                try self.register_manager.registers.ensureCapacity(self.gpa, self.register_manager.registers.count() + 1);
-                if (self.register_manager.tryAllocReg(inst)) |reg| {
-                    return MCValue{ .register = registerAlias(reg, abi_size) };
-                }
-            }
-        }
-        const stack_offset = try self.allocMem(inst, abi_size, abi_align);
-        return MCValue{ .stack_offset = stack_offset };
-    }
-
+    /// Actually not used in this file, but register manager calls this.
     pub fn spillInstruction(self: *Self, src: LazySrcLoc, reg: Register, inst: *ir.Inst) !void {
-        const stack_mcv = try self.allocRegOrMem(inst, false);
-        const reg_mcv = self.getResolvedInstValue(inst);
+        const stack_mcv = try CodegenUtils.allocRegOrMem(Self, self, inst, false);
+        const reg_mcv = CodegenUtils.getResolvedInstValue(Self, self, inst);
         assert(reg == toCanonicalReg(reg_mcv.register));
         const branch = &self.branch_stack.items[self.branch_stack.items.len - 1];
         try branch.inst_table.put(self.gpa, inst, stack_mcv);
         try self.genSetStack(src, inst.ty, stack_mcv.stack_offset, reg_mcv);
     }
 
-    /// Copies a value to a register without tracking the register. The register is not considered
-    /// allocated. A second call to `copyToTmpRegister` may return the same register.
-    /// This can have a side effect of spilling instructions to the stack to free up a register.
-    fn copyToTmpRegister(self: *Self, src: LazySrcLoc, ty: Type, mcv: MCValue) !Register {
-        const reg = try self.register_manager.allocRegWithoutTracking();
-        try self.genSetReg(src, ty, reg, mcv);
-        return reg;
-    }
-
-    /// Allocates a new register and copies `mcv` into it.
-    /// `reg_owner` is the instruction that gets associated with the register in the register table.
-    /// This can have a side effect of spilling instructions to the stack to free up a register.
-    fn copyToNewRegister(self: *Self, reg_owner: *ir.Inst, mcv: MCValue) !MCValue {
-        try self.register_manager.registers.ensureCapacity(self.gpa, @intCast(u32, self.register_manager.registers.count() + 1));
-
-        const reg = try self.register_manager.allocReg(reg_owner);
-        try self.genSetReg(reg_owner.src, reg_owner.ty, reg, mcv);
-        return MCValue{ .register = reg };
-    }
-
     fn genAlloc(self: *Self, inst: *ir.Inst.NoOp) !MCValue {
-        const stack_offset = try self.allocMemPtr(&inst.base);
+        const stack_offset = try CodegenUtils.allocMemPtr(Self, self, &inst.base);
         return MCValue{ .ptr_stack_offset = stack_offset };
     }
 
@@ -1312,7 +1147,7 @@ pub const Function = struct {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
-        return self.fail(inst.base.src, "TODO implement floatCast for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement floatCast for {}", .{arch});
     }
 
     fn genIntCast(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
@@ -1320,23 +1155,23 @@ pub const Function = struct {
         if (inst.base.isUnused())
             return MCValue.dead;
 
-        const operand = try self.resolveInst(inst.operand);
+        const operand = try CodegenUtils.resolveInst(Self, self, inst.operand);
         const info_a = inst.operand.ty.intInfo(self.target.*);
         const info_b = inst.base.ty.intInfo(self.target.*);
         if (info_a.signedness != info_b.signedness)
-            return self.fail(inst.base.src, "TODO gen intcast sign safety in semantic analysis", .{});
+            return CodegenUtils.fail(Self, self, inst.base.src, "TODO gen intcast sign safety in semantic analysis", .{});
 
         if (info_a.bits == info_b.bits)
             return operand;
 
-        return self.fail(inst.base.src, "TODO implement intCast for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement intCast for {}", .{arch});
     }
 
     fn genNot(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
-        const operand = try self.resolveInst(inst.operand);
+        const operand = try CodegenUtils.resolveInst(Self, self, inst.operand);
         switch (operand) {
             .dead => unreachable,
             .unreach => unreachable,
@@ -1386,7 +1221,7 @@ pub const Function = struct {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
-        return self.fail(inst.base.src, "TODO implement addwrap for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement addwrap for {}", .{arch});
     }
 
     fn genMul(self: *Self, inst: *ir.Inst.BinOp) !MCValue {
@@ -1400,77 +1235,77 @@ pub const Function = struct {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
-        return self.fail(inst.base.src, "TODO implement mulwrap for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement mulwrap for {}", .{arch});
     }
 
     fn genDiv(self: *Self, inst: *ir.Inst.BinOp) !MCValue {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
-        return self.fail(inst.base.src, "TODO implement div for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement div for {}", .{arch});
     }
 
     fn genBitAnd(self: *Self, inst: *ir.Inst.BinOp) !MCValue {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
-        return self.fail(inst.base.src, "TODO implement bitwise and for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement bitwise and for {}", .{arch});
     }
 
     fn genBitOr(self: *Self, inst: *ir.Inst.BinOp) !MCValue {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
-        return self.fail(inst.base.src, "TODO implement bitwise or for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement bitwise or for {}", .{arch});
     }
 
     fn genXor(self: *Self, inst: *ir.Inst.BinOp) !MCValue {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
-        return self.fail(inst.base.src, "TODO implement xor for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement xor for {}", .{arch});
     }
 
     fn genOptionalPayload(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
-        return self.fail(inst.base.src, "TODO implement .optional_payload for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement .optional_payload for {}", .{arch});
     }
 
     fn genOptionalPayloadPtr(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
-        return self.fail(inst.base.src, "TODO implement .optional_payload_ptr for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement .optional_payload_ptr for {}", .{arch});
     }
 
     fn genUnwrapErrErr(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
-        return self.fail(inst.base.src, "TODO implement unwrap error union error for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement unwrap error union error for {}", .{arch});
     }
 
     fn genUnwrapErrPayload(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
-        return self.fail(inst.base.src, "TODO implement unwrap error union payload for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement unwrap error union payload for {}", .{arch});
     }
     // *(E!T) -> E
     fn genUnwrapErrErrPtr(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
-        return self.fail(inst.base.src, "TODO implement unwrap error union error ptr for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement unwrap error union error ptr for {}", .{arch});
     }
     // *(E!T) -> *T
     fn genUnwrapErrPayloadPtr(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
-        return self.fail(inst.base.src, "TODO implement unwrap error union payload ptr for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement unwrap error union payload ptr for {}", .{arch});
     }
     fn genWrapOptional(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
         const optional_ty = inst.base.ty;
@@ -1483,7 +1318,7 @@ pub const Function = struct {
         if (optional_ty.abiSize(self.target.*) == 1)
             return MCValue{ .immediate = 1 };
 
-        return self.fail(inst.base.src, "TODO implement wrap optional for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement wrap optional for {}", .{arch});
     }
 
     /// T to E!T
@@ -1492,7 +1327,7 @@ pub const Function = struct {
         if (inst.base.isUnused())
             return MCValue.dead;
 
-        return self.fail(inst.base.src, "TODO implement wrap errunion payload for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement wrap errunion payload for {}", .{arch});
     }
 
     /// E to E!T
@@ -1501,14 +1336,14 @@ pub const Function = struct {
         if (inst.base.isUnused())
             return MCValue.dead;
 
-        return self.fail(inst.base.src, "TODO implement wrap errunion error for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement wrap errunion error for {}", .{arch});
     }
     fn genVarPtr(self: *Self, inst: *ir.Inst.VarPtr) !MCValue {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
 
-        return self.fail(inst.base.src, "TODO implement varptr for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement varptr for {}", .{arch});
     }
 
     fn reuseOperand(self: *Self, inst: *ir.Inst, op_index: ir.Inst.DeathsBitIndex, mcv: MCValue) bool {
@@ -1545,7 +1380,7 @@ pub const Function = struct {
         const elem_ty = inst.base.ty;
         if (!elem_ty.hasCodeGenBits())
             return MCValue.none;
-        const ptr = try self.resolveInst(inst.operand);
+        const ptr = try CodegenUtils.resolveInst(Self, self, inst.operand);
         const is_volatile = inst.operand.ty.isVolatilePtr();
         if (inst.base.isUnused() and !is_volatile)
             return MCValue.dead;
@@ -1554,7 +1389,7 @@ pub const Function = struct {
                 // The MCValue that holds the pointer can be re-used as the value.
                 break :blk ptr;
             } else {
-                break :blk try self.allocRegOrMem(&inst.base, true);
+                break :blk try CodegenUtils.allocRegOrMem(Self, self, &inst.base, true);
             }
         };
         switch (ptr) {
@@ -1564,30 +1399,30 @@ pub const Function = struct {
             .dead => unreachable,
             .compare_flags_unsigned => unreachable,
             .compare_flags_signed => unreachable,
-            .immediate => |imm| try self.setRegOrMem(inst.base.src, elem_ty, dst_mcv, .{ .memory = imm }),
-            .ptr_stack_offset => |off| try self.setRegOrMem(inst.base.src, elem_ty, dst_mcv, .{ .stack_offset = off }),
+            .immediate => |imm| try CodegenUtils.setRegOrMem(Self, self, inst.base.src, elem_ty, dst_mcv, .{ .memory = imm }),
+            .ptr_stack_offset => |off| try CodegenUtils.setRegOrMem(Self, self, inst.base.src, elem_ty, dst_mcv, .{ .stack_offset = off }),
             .ptr_embedded_in_code => |off| {
-                try self.setRegOrMem(inst.base.src, elem_ty, dst_mcv, .{ .embedded_in_code = off });
+                try CodegenUtils.setRegOrMem(Self, self, inst.base.src, elem_ty, dst_mcv, .{ .embedded_in_code = off });
             },
             .embedded_in_code => {
-                return self.fail(inst.base.src, "TODO implement loading from MCValue.embedded_in_code", .{});
+                return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement loading from MCValue.embedded_in_code", .{});
             },
             .register => {
-                return self.fail(inst.base.src, "TODO implement loading from MCValue.register", .{});
+                return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement loading from MCValue.register", .{});
             },
             .memory => {
-                return self.fail(inst.base.src, "TODO implement loading from MCValue.memory", .{});
+                return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement loading from MCValue.memory", .{});
             },
             .stack_offset => {
-                return self.fail(inst.base.src, "TODO implement loading from MCValue.stack_offset", .{});
+                return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement loading from MCValue.stack_offset", .{});
             },
         }
         return dst_mcv;
     }
 
     fn genStore(self: *Self, inst: *ir.Inst.BinOp) !MCValue {
-        const ptr = try self.resolveInst(inst.lhs);
-        const value = try self.resolveInst(inst.rhs);
+        const ptr = try CodegenUtils.resolveInst(Self, self, inst.lhs);
+        const value = try CodegenUtils.resolveInst(Self, self, inst.rhs);
         const elem_ty = inst.rhs.ty;
         switch (ptr) {
             .none => unreachable,
@@ -1597,32 +1432,32 @@ pub const Function = struct {
             .compare_flags_unsigned => unreachable,
             .compare_flags_signed => unreachable,
             .immediate => |imm| {
-                try self.setRegOrMem(inst.base.src, elem_ty, .{ .memory = imm }, value);
+                try CodegenUtils.setRegOrMem(Self, self, inst.base.src, elem_ty, .{ .memory = imm }, value);
             },
             .ptr_stack_offset => |off| {
                 try self.genSetStack(inst.base.src, elem_ty, off, value);
             },
             .ptr_embedded_in_code => |off| {
-                try self.setRegOrMem(inst.base.src, elem_ty, .{ .embedded_in_code = off }, value);
+                try CodegenUtils.setRegOrMem(Self, self, inst.base.src, elem_ty, .{ .embedded_in_code = off }, value);
             },
             .embedded_in_code => {
-                return self.fail(inst.base.src, "TODO implement storing to MCValue.embedded_in_code", .{});
+                return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement storing to MCValue.embedded_in_code", .{});
             },
             .register => {
-                return self.fail(inst.base.src, "TODO implement storing to MCValue.register", .{});
+                return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement storing to MCValue.register", .{});
             },
             .memory => {
-                return self.fail(inst.base.src, "TODO implement storing to MCValue.memory", .{});
+                return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement storing to MCValue.memory", .{});
             },
             .stack_offset => {
-                return self.fail(inst.base.src, "TODO implement storing to MCValue.stack_offset", .{});
+                return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement storing to MCValue.stack_offset", .{});
             },
         }
         return .none;
     }
 
     fn genStructFieldPtr(self: *Self, inst: *ir.Inst.StructFieldPtr) !MCValue {
-        return self.fail(inst.base.src, "TODO implement codegen struct_field_ptr", .{});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement codegen struct_field_ptr", .{});
     }
 
     fn genSub(self: *Self, inst: *ir.Inst.BinOp) !MCValue {
@@ -1636,7 +1471,7 @@ pub const Function = struct {
         // No side effects, so if it's unreferenced, do nothing.
         if (inst.base.isUnused())
             return MCValue.dead;
-        return self.fail(inst.base.src, "TODO implement subwrap for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement subwrap for {}", .{arch});
     }
 
     /// Perform "binary" operators, excluding comparisons.
@@ -1655,8 +1490,8 @@ pub const Function = struct {
 
         try self.code.ensureCapacity(self.code.items.len + 8);
 
-        const lhs = try self.resolveInst(op_lhs);
-        const rhs = try self.resolveInst(op_rhs);
+        const lhs = try CodegenUtils.resolveInst(Self, self, op_lhs);
+        const rhs = try CodegenUtils.resolveInst(Self, self, op_rhs);
 
         // There are 2 operands, destination and source.
         // Either one, but not both, can be a memory operand.
@@ -1671,7 +1506,7 @@ pub const Function = struct {
             // Both operands cannot be memory.
             src_inst = op_rhs;
             if (lhs.isMemory() and rhs.isMemory()) {
-                dst_mcv = try self.copyToNewRegister(inst, lhs);
+                dst_mcv = try CodegenUtils.copyToNewRegister(Self, self, inst, lhs);
                 src_mcv = rhs;
             } else {
                 dst_mcv = lhs;
@@ -1682,7 +1517,7 @@ pub const Function = struct {
             // Both operands cannot be memory.
             src_inst = op_lhs;
             if (lhs.isMemory() and rhs.isMemory()) {
-                dst_mcv = try self.copyToNewRegister(inst, rhs);
+                dst_mcv = try CodegenUtils.copyToNewRegister(Self, self, inst, rhs);
                 src_mcv = lhs;
             } else {
                 dst_mcv = rhs;
@@ -1690,11 +1525,11 @@ pub const Function = struct {
             }
         } else {
             if (lhs.isMemory()) {
-                dst_mcv = try self.copyToNewRegister(inst, lhs);
+                dst_mcv = try CodegenUtils.copyToNewRegister(Self, self, inst, lhs);
                 src_mcv = rhs;
                 src_inst = op_rhs;
             } else {
-                dst_mcv = try self.copyToNewRegister(inst, rhs);
+                dst_mcv = try CodegenUtils.copyToNewRegister(Self, self, inst, rhs);
                 src_mcv = lhs;
                 src_inst = op_lhs;
             }
@@ -1707,7 +1542,7 @@ pub const Function = struct {
         switch (src_mcv) {
             .immediate => |imm| {
                 if (imm > math.maxInt(u31)) {
-                    src_mcv = MCValue{ .register = try self.copyToTmpRegister(src_inst.src, Type.initTag(.u64), src_mcv) };
+                    src_mcv = MCValue{ .register = try CodegenUtils.copyToTmpRegister(Self, self, src_inst.src, Type.initTag(.u64), src_mcv) };
                 }
             },
             else => {},
@@ -1739,7 +1574,7 @@ pub const Function = struct {
             if (err == error.OutOfMemory)
                 return error.OutOfMemory
             else
-                return self.fail(src, "Instruction.encodeInto failed because {s}", .{@errorName(err)});
+                return CodegenUtils.fail(Self, self, src, "Instruction.encodeInto failed because {s}", .{@errorName(err)});
         };
     }
 
@@ -1883,7 +1718,7 @@ pub const Function = struct {
                         }
                     },
                     .embedded_in_code, .memory => {
-                        return self.fail(src, "TODO implement x86 ADD/SUB/CMP source memory", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement x86 ADD/SUB/CMP source memory", .{});
                     },
                     .stack_offset => |off| {
                         // register, indirect use mr + 3
@@ -1891,7 +1726,7 @@ pub const Function = struct {
                         const abi_size = dst_ty.abiSize(self.target.*);
                         const adj_off = off + abi_size;
                         if (off > math.maxInt(i32)) {
-                            return self.fail(src, "stack offset too large", .{});
+                            return CodegenUtils.fail(Self, self, src, "stack offset too large", .{});
                         }
                         const encoder = try X8664Encoder.init(self.code, 7);
                         encoder.rex(.{
@@ -1914,10 +1749,10 @@ pub const Function = struct {
                         }
                     },
                     .compare_flags_unsigned => {
-                        return self.fail(src, "TODO implement x86 ADD/SUB/CMP source compare flag (unsigned)", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement x86 ADD/SUB/CMP source compare flag (unsigned)", .{});
                     },
                     .compare_flags_signed => {
-                        return self.fail(src, "TODO implement x86 ADD/SUB/CMP source compare flag (signed)", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement x86 ADD/SUB/CMP source compare flag (signed)", .{});
                     },
                 }
             },
@@ -1932,21 +1767,21 @@ pub const Function = struct {
                         try self.genX8664ModRMRegToStack(src, dst_ty, off, src_reg, mr + 0x1);
                     },
                     .immediate => |imm| {
-                        return self.fail(src, "TODO implement x86 ADD/SUB/CMP source immediate", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement x86 ADD/SUB/CMP source immediate", .{});
                     },
                     .embedded_in_code, .memory, .stack_offset => {
-                        return self.fail(src, "TODO implement x86 ADD/SUB/CMP source memory", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement x86 ADD/SUB/CMP source memory", .{});
                     },
                     .compare_flags_unsigned => {
-                        return self.fail(src, "TODO implement x86 ADD/SUB/CMP source compare flag (unsigned)", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement x86 ADD/SUB/CMP source compare flag (unsigned)", .{});
                     },
                     .compare_flags_signed => {
-                        return self.fail(src, "TODO implement x86 ADD/SUB/CMP source compare flag (signed)", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement x86 ADD/SUB/CMP source compare flag (signed)", .{});
                     },
                 }
             },
             .embedded_in_code, .memory => {
-                return self.fail(src, "TODO implement x86 ADD/SUB/CMP destination memory", .{});
+                return CodegenUtils.fail(Self, self, src, "TODO implement x86 ADD/SUB/CMP destination memory", .{});
             },
         }
     }
@@ -2036,18 +1871,18 @@ pub const Function = struct {
                             );
                             encoder.imm32(@intCast(i32, imm));
                         } else {
-                            const src_reg = try self.copyToTmpRegister(src, dst_ty, src_mcv);
+                            const src_reg = try CodegenUtils.copyToTmpRegister(Self, self, src, dst_ty, src_mcv);
                             return self.genX8664Imul(src, dst_ty, dst_mcv, MCValue{ .register = src_reg });
                         }
                     },
                     .embedded_in_code, .memory, .stack_offset => {
-                        return self.fail(src, "TODO implement x86 multiply source memory", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement x86 multiply source memory", .{});
                     },
                     .compare_flags_unsigned => {
-                        return self.fail(src, "TODO implement x86 multiply source compare flag (unsigned)", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement x86 multiply source compare flag (unsigned)", .{});
                     },
                     .compare_flags_signed => {
-                        return self.fail(src, "TODO implement x86 multiply source compare flag (signed)", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement x86 multiply source compare flag (signed)", .{});
                     },
                 }
             },
@@ -2060,7 +1895,7 @@ pub const Function = struct {
                     .ptr_embedded_in_code => unreachable,
                     .register => |src_reg| {
                         // copy dst to a register
-                        const dst_reg = try self.copyToTmpRegister(src, dst_ty, dst_mcv);
+                        const dst_reg = try CodegenUtils.copyToTmpRegister(Self, self, src, dst_ty, dst_mcv);
                         // multiply into dst_reg
                         // register, register
                         // Use the following imul opcode
@@ -2081,21 +1916,21 @@ pub const Function = struct {
                         return self.genSetStack(src, dst_ty, off, MCValue{ .register = dst_reg });
                     },
                     .immediate => |imm| {
-                        return self.fail(src, "TODO implement x86 multiply source immediate", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement x86 multiply source immediate", .{});
                     },
                     .embedded_in_code, .memory, .stack_offset => {
-                        return self.fail(src, "TODO implement x86 multiply source memory", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement x86 multiply source memory", .{});
                     },
                     .compare_flags_unsigned => {
-                        return self.fail(src, "TODO implement x86 multiply source compare flag (unsigned)", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement x86 multiply source compare flag (unsigned)", .{});
                     },
                     .compare_flags_signed => {
-                        return self.fail(src, "TODO implement x86 multiply source compare flag (signed)", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement x86 multiply source compare flag (signed)", .{});
                     },
                 }
             },
             .embedded_in_code, .memory => {
-                return self.fail(src, "TODO implement x86 multiply destination memory", .{});
+                return CodegenUtils.fail(Self, self, src, "TODO implement x86 multiply destination memory", .{});
             },
         }
     }
@@ -2104,7 +1939,7 @@ pub const Function = struct {
         const abi_size = ty.abiSize(self.target.*);
         const adj_off = off + abi_size;
         if (off > math.maxInt(i32)) {
-            return self.fail(src, "stack offset too large", .{});
+            return CodegenUtils.fail(Self, self, src, "stack offset too large", .{});
         }
 
         const i_adj_off = -@intCast(i32, adj_off);
@@ -2145,7 +1980,7 @@ pub const Function = struct {
                             reg.dwarfLocOp(),
                         });
                         try dbg_out.dbg_info.ensureCapacity(dbg_out.dbg_info.items.len + 5 + name_with_null.len);
-                        try self.addDbgInfoTypeReloc(inst.base.ty); // DW.AT_type,  DW.FORM_ref4
+                        try CodegenUtils.addDbgInfoTypeReloc(Self, self, inst.base.ty); // DW.AT_type,  DW.FORM_ref4
                         dbg_out.dbg_info.appendSliceAssumeCapacity(name_with_null); // DW.AT_name, DW.FORM_string
                     },
                     .none => {},
@@ -2160,7 +1995,7 @@ pub const Function = struct {
         self.arg_index += 1;
 
         if (callee_preserved_regs.len == 0) {
-            return self.fail(inst.base.src, "TODO implement Register enum for {}", .{arch});
+            return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement Register enum for {}", .{arch});
         }
 
         const result = self.args[arg_index];
@@ -2195,7 +2030,7 @@ pub const Function = struct {
         if (self.bin_file.tag == link.File.Elf.base_tag or self.bin_file.tag == link.File.Coff.base_tag) {
             for (info.args) |mc_arg, arg_i| {
                 const arg = inst.args[arg_i];
-                const arg_mcv = try self.resolveInst(inst.args[arg_i]);
+                const arg_mcv = try CodegenUtils.resolveInst(Self, self, inst.args[arg_i]);
                 // Here we do not use setRegOrMem even though the logic is similar, because
                 // the function call will move the stack pointer, so the offsets are different.
                 switch (mc_arg) {
@@ -2207,13 +2042,13 @@ pub const Function = struct {
                     .stack_offset => {
                         // Here we need to emit instructions like this:
                         // mov     qword ptr [rsp + stack_offset], x
-                        return self.fail(inst.base.src, "TODO implement calling with parameters in memory", .{});
+                        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement calling with parameters in memory", .{});
                     },
                     .ptr_stack_offset => {
-                        return self.fail(inst.base.src, "TODO implement calling with MCValue.ptr_stack_offset arg", .{});
+                        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement calling with MCValue.ptr_stack_offset arg", .{});
                     },
                     .ptr_embedded_in_code => {
-                        return self.fail(inst.base.src, "TODO implement calling with MCValue.ptr_embedded_in_code arg", .{});
+                        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement calling with MCValue.ptr_embedded_in_code arg", .{});
                     },
                     .undef => unreachable,
                     .immediate => unreachable,
@@ -2245,17 +2080,17 @@ pub const Function = struct {
                     self.code.appendSliceAssumeCapacity(&[3]u8{ 0xff, 0x14, 0x25 });
                     mem.writeIntLittle(u32, self.code.addManyAsArrayAssumeCapacity(4), got_addr);
                 } else if (func_value.castTag(.extern_fn)) |_| {
-                    return self.fail(inst.base.src, "TODO implement calling extern functions", .{});
+                    return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement calling extern functions", .{});
                 } else {
-                    return self.fail(inst.base.src, "TODO implement calling bitcasted functions", .{});
+                    return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement calling bitcasted functions", .{});
                 }
             } else {
-                return self.fail(inst.base.src, "TODO implement calling runtime known function pointer", .{});
+                return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement calling runtime known function pointer", .{});
             }
         } else if (self.bin_file.cast(link.File.MachO)) |macho_file| {
             for (info.args) |mc_arg, arg_i| {
                 const arg = inst.args[arg_i];
-                const arg_mcv = try self.resolveInst(inst.args[arg_i]);
+                const arg_mcv = try CodegenUtils.resolveInst(Self, self, inst.args[arg_i]);
                 // Here we do not use setRegOrMem even though the logic is similar, because
                 // the function call will move the stack pointer, so the offsets are different.
                 switch (mc_arg) {
@@ -2267,13 +2102,13 @@ pub const Function = struct {
                     .stack_offset => {
                         // Here we need to emit instructions like this:
                         // mov     qword ptr [rsp + stack_offset], x
-                        return self.fail(inst.base.src, "TODO implement calling with parameters in memory", .{});
+                        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement calling with parameters in memory", .{});
                     },
                     .ptr_stack_offset => {
-                        return self.fail(inst.base.src, "TODO implement calling with MCValue.ptr_stack_offset arg", .{});
+                        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement calling with MCValue.ptr_stack_offset arg", .{});
                     },
                     .ptr_embedded_in_code => {
-                        return self.fail(inst.base.src, "TODO implement calling with MCValue.ptr_embedded_in_code arg", .{});
+                        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement calling with MCValue.ptr_embedded_in_code arg", .{});
                     },
                     .undef => unreachable,
                     .immediate => unreachable,
@@ -2322,10 +2157,10 @@ pub const Function = struct {
                     });
                     // We mark the space and fix it up later.
                 } else {
-                    return self.fail(inst.base.src, "TODO implement calling bitcasted functions", .{});
+                    return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement calling bitcasted functions", .{});
                 }
             } else {
-                return self.fail(inst.base.src, "TODO implement calling runtime known function pointer", .{});
+                return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement calling runtime known function pointer", .{});
             }
         } else {
             unreachable;
@@ -2335,7 +2170,7 @@ pub const Function = struct {
             .register => |reg| {
                 if (Register.allocIndex(reg) == null) {
                     // Save function return value in a callee saved register
-                    return try self.copyToNewRegister(&inst.base, info.return_value);
+                    return try CodegenUtils.copyToNewRegister(Self, self, &inst.base, info.return_value);
                 }
             },
             else => {},
@@ -2345,7 +2180,7 @@ pub const Function = struct {
     }
 
     fn genRef(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
-        const operand = try self.resolveInst(inst.operand);
+        const operand = try CodegenUtils.resolveInst(Self, self, inst.operand);
         switch (operand) {
             .unreach => unreachable,
             .dead => unreachable,
@@ -2358,7 +2193,7 @@ pub const Function = struct {
             .compare_flags_unsigned,
             .compare_flags_signed,
             => {
-                const stack_offset = try self.allocMemPtr(&inst.base);
+                const stack_offset = try CodegenUtils.allocMemPtr(Self, self, &inst.base);
                 try self.genSetStack(inst.base.src, inst.operand.ty, stack_offset, operand);
                 return MCValue{ .ptr_stack_offset = stack_offset };
             },
@@ -2367,13 +2202,13 @@ pub const Function = struct {
             .embedded_in_code => |offset| return MCValue{ .ptr_embedded_in_code = offset },
             .memory => |vaddr| return MCValue{ .immediate = vaddr },
 
-            .undef => return self.fail(inst.base.src, "TODO implement ref on an undefined value", .{}),
+            .undef => return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement ref on an undefined value", .{}),
         }
     }
 
     fn ret(self: *Self, src: LazySrcLoc, mcv: MCValue) !MCValue {
         const ret_ty = self.fn_type.fnReturnType();
-        try self.setRegOrMem(src, ret_ty, self.ret_mcv, mcv);
+        try CodegenUtils.setRegOrMem(Self, self, src, ret_ty, self.ret_mcv, mcv);
 
         // TODO when implementing defer, this will need to jump to the appropriate defer expression.
         // TODO optimization opportunity: figure out when we can emit this as a 2 byte instruction
@@ -2386,7 +2221,7 @@ pub const Function = struct {
     }
 
     fn genRet(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
-        const operand = try self.resolveInst(inst.operand);
+        const operand = try CodegenUtils.resolveInst(Self, self, inst.operand);
         return self.ret(inst.base.src, operand);
     }
 
@@ -2399,18 +2234,18 @@ pub const Function = struct {
         if (inst.base.isUnused())
             return MCValue{ .dead = {} };
         if (inst.lhs.ty.zigTypeTag() == .ErrorSet or inst.rhs.ty.zigTypeTag() == .ErrorSet)
-            return self.fail(inst.base.src, "TODO implement cmp for errors", .{});
+            return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement cmp for errors", .{});
 
         try self.code.ensureCapacity(self.code.items.len + 8);
 
-        const lhs = try self.resolveInst(inst.lhs);
-        const rhs = try self.resolveInst(inst.rhs);
+        const lhs = try CodegenUtils.resolveInst(Self, self, inst.lhs);
+        const rhs = try CodegenUtils.resolveInst(Self, self, inst.rhs);
 
         // There are 2 operands, destination and source.
         // Either one, but not both, can be a memory operand.
         // Source operand can be an immediate, 8 bits or 32 bits.
         const dst_mcv = if (lhs.isImmediate() or (lhs.isMemory() and rhs.isMemory()))
-            try self.copyToNewRegister(&inst.base, lhs)
+            try CodegenUtils.copyToNewRegister(Self, self, &inst.base, lhs)
         else
             lhs;
         // This instruction supports only signed 32-bit immediates at most.
@@ -2429,13 +2264,13 @@ pub const Function = struct {
         // well to be more efficient, as well as support inlined function calls correctly.
         // For now we convert LazySrcLoc to absolute byte offset, to match what the
         // existing codegen code expects.
-        try self.dbgAdvancePCAndLine(inst.byte_offset);
+        try CodegenUtils.dbgAdvancePCAndLine(Self, self, inst.byte_offset);
         assert(inst.base.isUnused());
         return MCValue.dead;
     }
 
     fn genCondBr(self: *Self, inst: *ir.Inst.CondBr) !MCValue {
-        const cond = try self.resolveInst(inst.condition);
+        const cond = try CodegenUtils.resolveInst(Self, self, inst.condition);
 
         const reloc: Reloc = reloc: {
             try self.code.ensureCapacity(self.code.items.len + 6);
@@ -2483,7 +2318,7 @@ pub const Function = struct {
                     encoder.disp8(1);
                     break :blk 0x84;
                 },
-                else => return self.fail(inst.base.src, "TODO implement condbr {s} when condition is {s}", .{ arch, @tagName(cond) }),
+                else => return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement condbr {s} when condition is {s}", .{ arch, @tagName(cond) }),
             };
             self.code.appendSliceAssumeCapacity(&[_]u8{ 0x0f, opcode });
             const reloc = Reloc{ .rel32 = self.code.items.len };
@@ -2502,9 +2337,9 @@ pub const Function = struct {
         try self.branch_stack.append(.{});
 
         const then_deaths = inst.thenDeaths();
-        try self.ensureProcessDeathCapacity(then_deaths.len);
+        try CodegenUtils.ensureProcessDeathCapacity(Self, self, then_deaths.len);
         for (then_deaths) |operand| {
-            self.processDeath(operand);
+            CodegenUtils.processDeath(Self, self, operand);
         }
         try self.genBody(inst.then_body);
 
@@ -2529,9 +2364,9 @@ pub const Function = struct {
         else_branch.* = .{};
 
         const else_deaths = inst.elseDeaths();
-        try self.ensureProcessDeathCapacity(else_deaths.len);
+        try CodegenUtils.ensureProcessDeathCapacity(Self, self, else_deaths.len);
         for (else_deaths) |operand| {
-            self.processDeath(operand);
+            CodegenUtils.processDeath(Self, self, operand);
         }
         try self.genBody(inst.else_body);
 
@@ -2571,7 +2406,7 @@ pub const Function = struct {
             log.debug("consolidating else_entry {*} {}=>{}", .{ else_entry.key, else_entry.value, canon_mcv });
             // TODO make sure the destination stack offset / register does not already have something
             // going on there.
-            try self.setRegOrMem(inst.base.src, else_entry.key.ty, canon_mcv, else_entry.value);
+            try CodegenUtils.setRegOrMem(Self, self, inst.base.src, else_entry.key.ty, canon_mcv, else_entry.value);
             // TODO track the new register / stack allocation
         }
         try parent_branch.inst_table.ensureCapacity(self.gpa, parent_branch.inst_table.items().len +
@@ -2595,7 +2430,7 @@ pub const Function = struct {
             log.debug("consolidating then_entry {*} {}=>{}", .{ then_entry.key, parent_mcv, then_entry.value });
             // TODO make sure the destination stack offset / register does not already have something
             // going on there.
-            try self.setRegOrMem(inst.base.src, then_entry.key.ty, parent_mcv, then_entry.value);
+            try CodegenUtils.setRegOrMem(Self, self, inst.base.src, then_entry.key.ty, parent_mcv, then_entry.value);
             // TODO track the new register / stack allocation
         }
 
@@ -2605,37 +2440,37 @@ pub const Function = struct {
     }
 
     fn genIsNull(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
-        return self.fail(inst.base.src, "TODO implement isnull for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement isnull for {}", .{arch});
     }
 
     fn genIsNullPtr(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
-        return self.fail(inst.base.src, "TODO load the operand and call genIsNull", .{});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO load the operand and call genIsNull", .{});
     }
 
     fn genIsNonNull(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
         // Here you can specialize this instruction if it makes sense to, otherwise the default
         // will call genIsNull and invert the result.
-        return self.fail(inst.base.src, "TODO call genIsNull and invert the result ", .{});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO call genIsNull and invert the result ", .{});
     }
 
     fn genIsNonNullPtr(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
-        return self.fail(inst.base.src, "TODO load the operand and call genIsNonNull", .{});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO load the operand and call genIsNonNull", .{});
     }
 
     fn genIsErr(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
-        return self.fail(inst.base.src, "TODO implement iserr for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement iserr for {}", .{arch});
     }
 
     fn genIsErrPtr(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
-        return self.fail(inst.base.src, "TODO load the operand and call genIsErr", .{});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO load the operand and call genIsErr", .{});
     }
 
     fn genErrorToInt(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
-        return self.resolveInst(inst.operand);
+        return CodegenUtils.resolveInst(Self, self, inst.operand);
     }
 
     fn genIntToError(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
-        return self.resolveInst(inst.operand);
+        return CodegenUtils.resolveInst(Self, self, inst.operand);
     }
 
     fn genLoop(self: *Self, inst: *ir.Inst.Loop) !MCValue {
@@ -2680,7 +2515,7 @@ pub const Function = struct {
     }
 
     fn genSwitch(self: *Self, inst: *ir.Inst.SwitchBr) !MCValue {
-        return self.fail(inst.base.src, "TODO genSwitch for {}", .{arch});
+        return CodegenUtils.fail(Self, self, inst.base.src, "TODO genSwitch for {}", .{arch});
     }
 
     fn performReloc(self: *Self, src: LazySrcLoc, reloc: Reloc) !void {
@@ -2694,7 +2529,7 @@ pub const Function = struct {
                 // best place to elide jumps will be in semantic analysis, by inlining blocks that only
                 // only have 1 break instruction.
                 const s32_amt = math.cast(i32, amt) catch
-                    return self.fail(src, "unable to perform relocation: jump too far", .{});
+                    return CodegenUtils.fail(Self, self, src, "unable to perform relocation: jump too far", .{});
                 mem.writeIntLittle(i32, self.code.items[pos..][0..4], s32_amt);
             },
             .arm_branch => unreachable, // attempting to perfrom an ARM relocation on a non-ARM target arch
@@ -2729,12 +2564,12 @@ pub const Function = struct {
 
     fn br(self: *Self, src: LazySrcLoc, block: *ir.Inst.Block, operand: *ir.Inst) !MCValue {
         if (operand.ty.hasCodeGenBits()) {
-            const operand_mcv = try self.resolveInst(operand);
+            const operand_mcv = try CodegenUtils.resolveInst(Self, self, operand);
             const block_mcv = @bitCast(MCValue, block.codegen.mcv);
             if (block_mcv == .none) {
                 block.codegen.mcv = @bitCast(AnyMCValue, operand_mcv);
             } else {
-                try self.setRegOrMem(src, block.base.ty, block_mcv, operand_mcv);
+                try CodegenUtils.setRegOrMem(Self, self, src, block.base.ty, block_mcv, operand_mcv);
             }
         }
         return self.brVoid(src, block);
@@ -2760,14 +2595,14 @@ pub const Function = struct {
 
         for (inst.inputs) |input, i| {
             if (input.len < 3 or input[0] != '{' or input[input.len - 1] != '}') {
-                return self.fail(inst.base.src, "unrecognized asm input constraint: '{s}'", .{input});
+                return CodegenUtils.fail(Self, self, inst.base.src, "unrecognized asm input constraint: '{s}'", .{input});
             }
             const reg_name = input[1 .. input.len - 1];
             const reg = parseRegName(reg_name) orelse
-                return self.fail(inst.base.src, "unrecognized register: '{s}'", .{reg_name});
+                return CodegenUtils.fail(Self, self, inst.base.src, "unrecognized register: '{s}'", .{reg_name});
 
             const arg = inst.args[i];
-            const arg_mcv = try self.resolveInst(arg);
+            const arg_mcv = try CodegenUtils.resolveInst(Self, self, arg);
             try self.register_manager.getRegWithoutTracking(reg);
             try self.genSetReg(inst.base.src, arg.ty, reg, arg_mcv);
         }
@@ -2775,36 +2610,23 @@ pub const Function = struct {
         if (mem.eql(u8, inst.asm_source, "syscall")) {
             try self.code.appendSlice(&[_]u8{ 0x0f, 0x05 });
         } else if (inst.asm_source.len != 0) {
-            return self.fail(inst.base.src, "TODO implement support for more x86 assembly instructions", .{});
+            return CodegenUtils.fail(Self, self, inst.base.src, "TODO implement support for more x86 assembly instructions", .{});
         }
 
         if (inst.output_name) |output| {
             if (output.len < 4 or output[0] != '=' or output[1] != '{' or output[output.len - 1] != '}') {
-                return self.fail(inst.base.src, "unrecognized asm output constraint: '{s}'", .{output});
+                return CodegenUtils.fail(Self, self, inst.base.src, "unrecognized asm output constraint: '{s}'", .{output});
             }
             const reg_name = output[2 .. output.len - 1];
             const reg = parseRegName(reg_name) orelse
-                return self.fail(inst.base.src, "unrecognized register: '{s}'", .{reg_name});
+                return CodegenUtils.fail(Self, self, inst.base.src, "unrecognized register: '{s}'", .{reg_name});
             return MCValue{ .register = reg };
         } else {
             return MCValue.none;
         }
     }
 
-    /// Sets the value without any modifications to register allocation metadata or stack allocation metadata.
-    fn setRegOrMem(self: *Self, src: LazySrcLoc, ty: Type, loc: MCValue, val: MCValue) !void {
-        switch (loc) {
-            .none => return,
-            .register => |reg| return self.genSetReg(src, ty, reg, val),
-            .stack_offset => |off| return self.genSetStack(src, ty, off, val),
-            .memory => {
-                return self.fail(src, "TODO implement setRegOrMem for memory", .{});
-            },
-            else => unreachable,
-        }
-    }
-
-    fn genSetStack(self: *Self, src: LazySrcLoc, ty: Type, stack_offset: u32, mcv: MCValue) InnerError!void {
+    pub fn genSetStack(self: *Self, src: LazySrcLoc, ty: Type, stack_offset: u32, mcv: MCValue) InnerError!void {
         switch (mcv) {
             .dead => unreachable,
             .ptr_stack_offset => unreachable,
@@ -2819,28 +2641,28 @@ pub const Function = struct {
                     2 => return self.genSetStack(src, ty, stack_offset, .{ .immediate = 0xaaaa }),
                     4 => return self.genSetStack(src, ty, stack_offset, .{ .immediate = 0xaaaaaaaa }),
                     8 => return self.genSetStack(src, ty, stack_offset, .{ .immediate = 0xaaaaaaaaaaaaaaaa }),
-                    else => return self.fail(src, "TODO implement memset", .{}),
+                    else => return CodegenUtils.fail(Self, self, src, "TODO implement memset", .{}),
                 }
             },
             .compare_flags_unsigned => |op| {
-                return self.fail(src, "TODO implement set stack variable with compare flags value (unsigned)", .{});
+                return CodegenUtils.fail(Self, self, src, "TODO implement set stack variable with compare flags value (unsigned)", .{});
             },
             .compare_flags_signed => |op| {
-                return self.fail(src, "TODO implement set stack variable with compare flags value (signed)", .{});
+                return CodegenUtils.fail(Self, self, src, "TODO implement set stack variable with compare flags value (signed)", .{});
             },
             .immediate => |x_big| {
                 const abi_size = ty.abiSize(self.target.*);
                 const adj_off = stack_offset + abi_size;
                 if (adj_off > 128) {
-                    return self.fail(src, "TODO implement set stack variable with large stack offset", .{});
+                    return CodegenUtils.fail(Self, self, src, "TODO implement set stack variable with large stack offset", .{});
                 }
                 try self.code.ensureCapacity(self.code.items.len + 8);
                 switch (abi_size) {
                     1 => {
-                        return self.fail(src, "TODO implement set abi_size=1 stack variable with immediate", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement set abi_size=1 stack variable with immediate", .{});
                     },
                     2 => {
-                        return self.fail(src, "TODO implement set abi_size=2 stack variable with immediate", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement set abi_size=2 stack variable with immediate", .{});
                     },
                     4 => {
                         const x = @intCast(u32, x_big);
@@ -2873,30 +2695,30 @@ pub const Function = struct {
                         self.code.appendSliceAssumeCapacity(buf[0..4]);
                     },
                     else => {
-                        return self.fail(src, "TODO implement set abi_size=large stack variable with immediate", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement set abi_size=large stack variable with immediate", .{});
                     },
                 }
             },
             .embedded_in_code => |code_offset| {
-                return self.fail(src, "TODO implement set stack variable from embedded_in_code", .{});
+                return CodegenUtils.fail(Self, self, src, "TODO implement set stack variable from embedded_in_code", .{});
             },
             .register => |reg| {
                 try self.genX8664ModRMRegToStack(src, ty, stack_offset, reg, 0x89);
             },
             .memory => |vaddr| {
-                return self.fail(src, "TODO implement set stack variable from memory vaddr", .{});
+                return CodegenUtils.fail(Self, self, src, "TODO implement set stack variable from memory vaddr", .{});
             },
             .stack_offset => |off| {
                 if (stack_offset == off)
                     return; // Copy stack variable to itself; nothing to do.
 
-                const reg = try self.copyToTmpRegister(src, ty, mcv);
+                const reg = try CodegenUtils.copyToTmpRegister(Self, self, src, ty, mcv);
                 return self.genSetStack(src, ty, stack_offset, MCValue{ .register = reg });
             },
         }
     }
 
-    fn genSetReg(self: *Self, src: LazySrcLoc, ty: Type, reg: Register, mcv: MCValue) InnerError!void {
+    pub fn genSetReg(self: *Self, src: LazySrcLoc, ty: Type, reg: Register, mcv: MCValue) InnerError!void {
         switch (mcv) {
             .dead => unreachable,
             .ptr_stack_offset => unreachable,
@@ -2936,7 +2758,7 @@ pub const Function = struct {
                 );
             },
             .compare_flags_signed => |op| {
-                return self.fail(src, "TODO set register with compare flags value (signed)", .{});
+                return CodegenUtils.fail(Self, self, src, "TODO set register with compare flags value (signed)", .{});
             },
             .immediate => |x| {
                 // 32-bit moves zero-extend to 64-bit, so xoring the 32-bit
@@ -3069,7 +2891,7 @@ pub const Function = struct {
                             .size = 4,
                         });
                     } else {
-                        return self.fail(src, "TODO implement genSetReg for PIE GOT indirection on this platform", .{});
+                        return CodegenUtils.fail(Self, self, src, "TODO implement genSetReg for PIE GOT indirection on this platform", .{});
                     }
 
                     // MOV reg, [reg]
@@ -3148,7 +2970,7 @@ pub const Function = struct {
                 const abi_size = ty.abiSize(self.target.*);
                 const off = unadjusted_off + abi_size;
                 if (off < std.math.minInt(i32) or off > std.math.maxInt(i32)) {
-                    return self.fail(src, "stack offset too large", .{});
+                    return CodegenUtils.fail(Self, self, src, "stack offset too large", .{});
                 }
                 const ioff = -@intCast(i32, off);
                 const encoder = try X8664Encoder.init(self.code, 3);
@@ -3172,42 +2994,12 @@ pub const Function = struct {
 
     fn genPtrToInt(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
         // no-op
-        return self.resolveInst(inst.operand);
+        return CodegenUtils.resolveInst(Self, self, inst.operand);
     }
 
     fn genBitCast(self: *Self, inst: *ir.Inst.UnOp) !MCValue {
-        const operand = try self.resolveInst(inst.operand);
+        const operand = try CodegenUtils.resolveInst(Self, self, inst.operand);
         return operand;
-    }
-
-    fn resolveInst(self: *Self, inst: *ir.Inst) !MCValue {
-        // If the type has no codegen bits, no need to store it.
-        if (!inst.ty.hasCodeGenBits())
-            return MCValue.none;
-
-        // Constants have static lifetimes, so they are always memoized in the outer most table.
-        if (inst.castTag(.constant)) |const_inst| {
-            const branch = &self.branch_stack.items[0];
-            const gop = try branch.inst_table.getOrPut(self.gpa, inst);
-            if (!gop.found_existing) {
-                gop.entry.value = try self.genTypedValue(inst.src, .{ .ty = inst.ty, .val = const_inst.val });
-            }
-            return gop.entry.value;
-        }
-
-        return self.getResolvedInstValue(inst);
-    }
-
-    fn getResolvedInstValue(self: *Self, inst: *ir.Inst) MCValue {
-        // Treat each stack item as a "layer" on top of the previous one.
-        var i: usize = self.branch_stack.items.len;
-        while (true) {
-            i -= 1;
-            if (self.branch_stack.items[i].inst_table.get(inst)) |mcv| {
-                assert(mcv != .dead);
-                return mcv;
-            }
-        }
     }
 
     /// If the MCValue is an immediate, and it does not fit within this type,
@@ -3216,81 +3008,19 @@ pub const Function = struct {
     /// of the fact that the instruction is available both as an immediate
     /// and as a register.
     fn limitImmediateType(self: *Self, inst: *ir.Inst, comptime T: type) !MCValue {
-        const mcv = try self.resolveInst(inst);
+        const mcv = try CodegenUtils.resolveInst(Self, self, inst);
         const ti = @typeInfo(T).Int;
         switch (mcv) {
             .immediate => |imm| {
                 // This immediate is unsigned.
                 const U = std.meta.Int(.unsigned, ti.bits - @boolToInt(ti.signedness == .signed));
                 if (imm >= math.maxInt(U)) {
-                    return MCValue{ .register = try self.copyToTmpRegister(inst.src, Type.initTag(.usize), mcv) };
+                    return MCValue{ .register = try CodegenUtils.copyToTmpRegister(Self, self, inst.src, Type.initTag(.usize), mcv) };
                 }
             },
             else => {},
         }
         return mcv;
-    }
-
-    fn genTypedValue(self: *Self, src: LazySrcLoc, typed_value: TypedValue) InnerError!MCValue {
-        if (typed_value.val.isUndef())
-            return MCValue{ .undef = {} };
-        const ptr_bits = arch.ptrBitWidth();
-        const ptr_bytes: u64 = @divExact(ptr_bits, 8);
-        switch (typed_value.ty.zigTypeTag()) {
-            .Pointer => {
-                if (typed_value.val.castTag(.decl_ref)) |payload| {
-                    if (self.bin_file.cast(link.File.Elf)) |elf_file| {
-                        const decl = payload.data;
-                        const got = &elf_file.program_headers.items[elf_file.phdr_got_index.?];
-                        const got_addr = got.p_vaddr + decl.link.elf.offset_table_index * ptr_bytes;
-                        return MCValue{ .memory = got_addr };
-                    } else if (self.bin_file.cast(link.File.MachO)) |macho_file| {
-                        const decl = payload.data;
-                        const got_addr = blk: {
-                            const seg = macho_file.load_commands.items[macho_file.data_const_segment_cmd_index.?].Segment;
-                            const got = seg.sections.items[macho_file.got_section_index.?];
-                            break :blk got.addr + decl.link.macho.offset_table_index * ptr_bytes;
-                        };
-                        return MCValue{ .memory = got_addr };
-                    } else if (self.bin_file.cast(link.File.Coff)) |coff_file| {
-                        const decl = payload.data;
-                        const got_addr = coff_file.offset_table_virtual_address + decl.link.coff.offset_table_index * ptr_bytes;
-                        return MCValue{ .memory = got_addr };
-                    } else {
-                        return self.fail(src, "TODO codegen non-ELF const Decl pointer", .{});
-                    }
-                }
-                return self.fail(src, "TODO codegen more kinds of const pointers", .{});
-            },
-            .Int => {
-                const info = typed_value.ty.intInfo(self.target.*);
-                if (info.bits > ptr_bits or info.signedness == .signed) {
-                    return self.fail(src, "TODO const int bigger than ptr and signed int", .{});
-                }
-                return MCValue{ .immediate = typed_value.val.toUnsignedInt() };
-            },
-            .Bool => {
-                return MCValue{ .immediate = @boolToInt(typed_value.val.toBool()) };
-            },
-            .ComptimeInt => unreachable, // semantic analysis prevents this
-            .ComptimeFloat => unreachable, // semantic analysis prevents this
-            .Optional => {
-                if (typed_value.ty.isPtrLikeOptional()) {
-                    if (typed_value.val.isNull())
-                        return MCValue{ .immediate = 0 };
-
-                    var buf: Type.Payload.ElemType = undefined;
-                    return self.genTypedValue(src, .{
-                        .ty = typed_value.ty.optionalChild(&buf),
-                        .val = typed_value.val,
-                    });
-                } else if (typed_value.ty.abiSize(self.target.*) == 1) {
-                    return MCValue{ .immediate = @boolToInt(typed_value.val.isNull()) };
-                }
-                return self.fail(src, "TODO non pointer optionals", .{});
-            },
-            else => return self.fail(src, "TODO implement const of type '{}'", .{typed_value.ty}),
-        }
     }
 
     const CallMCValues = struct {
@@ -3355,13 +3085,13 @@ pub const Function = struct {
                                 }
                             }
                         },
-                        else => return self.fail(src, "TODO implement function parameters of type {s}", .{@tagName(ty.zigTypeTag())}),
+                        else => return CodegenUtils.fail(Self, self, src, "TODO implement function parameters of type {s}", .{@tagName(ty.zigTypeTag())}),
                     }
                 }
                 result.stack_byte_count = next_stack_offset;
                 result.stack_align = 16;
             },
-            else => return self.fail(src, "TODO implement function parameters for {} on x86_64", .{cc}),
+            else => return CodegenUtils.fail(Self, self, src, "TODO implement function parameters for {} on x86_64", .{cc}),
         }
 
         if (ret_ty.zigTypeTag() == .NoReturn) {
@@ -3375,7 +3105,7 @@ pub const Function = struct {
                 const aliased_reg = registerAlias(c_abi_int_return_regs[0], ret_ty_size);
                 result.return_value = .{ .register = aliased_reg };
             },
-            else => return self.fail(src, "TODO implement function return values for {}", .{cc}),
+            else => return CodegenUtils.fail(Self, self, src, "TODO implement function return values for {}", .{cc}),
         }
 
         return result;
@@ -3391,24 +3121,6 @@ pub const Function = struct {
         };
     }
 
-    fn fail(self: *Self, src: LazySrcLoc, comptime format: []const u8, args: anytype) InnerError {
-        @setCold(true);
-        assert(self.err_msg == null);
-        const src_loc = if (src != .unneeded)
-            src.toSrcLocWithDecl(self.mod_fn.owner_decl)
-        else
-            self.src_loc;
-        self.err_msg = try ErrorMsg.create(self.bin_file.allocator, src_loc, format, args);
-        return error.CodegenFail;
-    }
-
-    fn failSymbol(self: *Self, comptime format: []const u8, args: anytype) InnerError {
-        @setCold(true);
-        assert(self.err_msg == null);
-        self.err_msg = try ErrorMsg.create(self.bin_file.allocator, self.src_loc, format, args);
-        return error.CodegenFail;
-    }
-
     fn parseRegName(name: []const u8) ?Register {
         if (@hasDecl(Register, "parseRegName")) {
             return Register.parseRegName(name);
@@ -3416,7 +3128,7 @@ pub const Function = struct {
         return std.meta.stringToEnum(Register, name);
     }
 
-    fn registerAlias(reg: Register, size_bytes: u32) Register {
+    pub fn registerAlias(reg: Register, size_bytes: u32) Register {
         // For x86_64 we have to pick a smaller register alias depending on abi size.
         switch (size_bytes) {
             1 => return reg.to8(),
@@ -3429,7 +3141,7 @@ pub const Function = struct {
 
     /// For most architectures this does nothing. For x86_64 it resolves any aliased registers
     /// to the 64-bit wide ones.
-    fn toCanonicalReg(reg: Register) Register {
+    pub fn toCanonicalReg(reg: Register) Register {
         return reg.to64();
     }
 };
